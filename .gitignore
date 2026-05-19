@@ -29,6 +29,9 @@ build/
 *.swp
 *.swo
 
+# Claude Code local session data
+.claude/
+
 # Testing
 .pytest_cache/
 .coverage

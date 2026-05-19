@@ -14,39 +14,68 @@ TINKERCAD_DASHBOARD = f"{TINKERCAD_BASE}/dashboard"
 TINKERCAD_LOGIN = f"{TINKERCAD_BASE}/login"
 
 # ── DOM Selectors ─────────────────────────────────────────────────────────────
-# All selectors in one place — update here when Tinkercad changes its DOM.
+# All selectors verified against live Tinkercad DOM (2026-05-19).
+# Update here when Tinkercad changes its DOM — nowhere else.
 
 SEL: dict[str, str] = {
-    # Auth
-    "btn_login": "[data-testid='login-button'], a[href*='login'], button:has-text('Sign In')",
-    "user_avatar": "[data-testid='user-avatar'], .user-avatar, img[alt*='avatar'], [aria-label*='account']",
-    "user_name": "[data-testid='user-name'], .username, [aria-label*='username']",
-    # Dashboard tabs
-    "tab_3d": "[data-testid='3d-designs-tab'], button:has-text('3D Designs')",
-    "tab_circuits": "[data-testid='circuits-tab'], button:has-text('Circuits')",
-    # Design cards (dashboard)
-    "design_cards": "[data-testid='design-card'], .design-card, [class*='DesignCard']",
-    "design_card_title": "[data-testid='design-title'], .design-title, [class*='title']",
-    "design_card_id": "[data-testid='design-id'], [data-id]",
-    "btn_create_design": "[data-testid='create-design'], button:has-text('Create new design')",
-    "btn_create_circuit": "[data-testid='create-circuit'], button:has-text('Create new circuit')",
-    "btn_delete_design": "[data-testid='delete-design'], button:has-text('Delete')",
-    "btn_confirm_delete": "[data-testid='confirm-delete'], button:has-text('OK'), button:has-text('Confirm')",
-    "design_name_input": "[data-testid='design-name-input'], input[placeholder*='name'], input[name='name']",
-    # 3D editor
-    "btn_export": "[data-testid='export-btn'], button:has-text('Export')",
-    "btn_export_stl": "[data-testid='export-stl'], button:has-text('STL')",
-    "shape_toolbar": "[data-testid='shape-toolbar'], .shape-toolbar",
-    # Circuit editor
-    "circuit_canvas": "[data-testid='circuit-canvas'], #circuit-canvas, canvas",
-    "btn_start_sim": "[data-testid='start-simulation'], button:has-text('Start Simulation')",
-    "btn_stop_sim": "[data-testid='stop-simulation'], button:has-text('Stop Simulation')",
-    "serial_monitor": "[data-testid='serial-monitor'], .serial-monitor, [class*='SerialMonitor']",
-    "serial_output": "[data-testid='serial-output'], .serial-output, [class*='output']",
-    "component_search": "[data-testid='component-search'], input[placeholder*='Search'], .component-search input",
-    "btn_add_code": "[data-testid='code-editor-btn'], button:has-text('Code')",
-    "code_editor": "[data-testid='code-editor'], .code-editor, textarea[class*='code']",
-    "btn_upload_code": "[data-testid='upload-code'], button:has-text('Upload')",
+    # ── Auth ──────────────────────────────────────────────────────────────────
+    # Login page has a standard Autodesk OAuth redirect; no special button needed.
+    # After manual login the page redirects to /dashboard automatically.
+    "btn_login": "a[href*='login'], a[href*='autodesk']",
+
+    # Header avatar (top-right) — triggers user menu dropdown
+    "user_avatar": ".header-avatar-trigger",
+
+    # Sidebar username text (below avatar photo in left sidebar)
+    "user_name": ".dashboard-avatar-username",
+
+    # ── Dashboard — navigation ────────────────────────────────────────────────
+    # Filter pills on /dashboard/designs page (icon + text tabs)
+    "tab_3d":       "a.filter-3d",
+    "tab_circuits": "a.filter-circuits",
+
+    # ── Dashboard — design cards ──────────────────────────────────────────────
+    # Angular custom element; one per design/circuit
+    "design_cards":      "tk-thing-box",
+    # H3 inside each card (no class — use descendant selector in code)
+    "design_card_title": "tk-thing-box h3",
+    # Thumbnail div carries the design ID: id="thumbnail-{designId}"
+    "design_card_thumb": ".thumbnail[id^='thumbnail-']",
+
+    # ── Dashboard — create ────────────────────────────────────────────────────
+    # Step 1: open the Create dropdown (visible at ≥1280 px wide)
+    "btn_create_dropdown": "#create-design",
+    # Step 2a: 3D Design option inside the dropdown
+    "btn_create_design":   "#dashboard-create-3d-design",
+    # Step 2b: Circuit option inside the dropdown
+    "btn_create_circuit":  "#dashboard-create-circuits",
+
+    # ── Dashboard — delete ────────────────────────────────────────────────────
+    # Per-card gear/dots button (opens Properties/Duplicate/Delete menu)
+    "btn_card_menu":    "button.dropdown-toggle.compact[title='Design actions']",
+    # Delete item inside the per-card dropdown
+    "btn_delete_design": "[id$='delete'] a.dropdown-item",
+    # Confirm-delete modal button (TODO: verify selector when modal opens)
+    "btn_confirm_delete": ".modal .btn-danger, .modal button.button-md:not(.button-cancel)",
+
+    # ── 3D editor ─────────────────────────────────────────────────────────────
+    # TODO: verify after opening a 3D design editor
+    "design_name_input": "input[name='name'], input[placeholder*='name']",
+    "btn_export":        "button[title*='Export'], button[aria-label*='Export']",
+    "btn_export_stl":    "button[title='STL'], a[title='STL']",
+    "shape_toolbar":     ".shape-toolbar, [class*='ShapePanel']",
+
+    # ── Circuit editor ────────────────────────────────────────────────────────
+    # TODO: verify after opening a circuit editor
+    "circuit_canvas":    "canvas#my-canvas, canvas[class*='circuit'], canvas",
+    "btn_start_sim":     "button[title*='Start'], button[aria-label*='Start Simulation']",
+    "btn_stop_sim":      "button[title*='Stop'], button[aria-label*='Stop Simulation']",
+    "serial_monitor":    "[class*='serial-monitor'], [class*='SerialMonitor']",
+    "serial_output":     "[class*='serial-output'], [class*='console-output']",
+    "component_search":  "input[placeholder*='Search'], input[placeholder*='search']",
+    "btn_add_code":      "button[title*='Code'], button[aria-label*='Code Editor']",
+    "code_editor":       "textarea.code-input, [class*='CodeMirror'] textarea, .ace_editor",
+    "btn_upload_code":   "button[title*='Upload'], button[aria-label*='Upload']",
 }
 
 # ── Component catalog ─────────────────────────────────────────────────────────

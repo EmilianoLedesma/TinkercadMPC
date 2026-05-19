@@ -112,56 +112,77 @@ async def get_session_status() -> str:
 # ── 2. 3D Designs ─────────────────────────────────────────────────────────────
 
 
+async def _list_items_from_dashboard(url: str, item_key: str) -> list[dict]:
+    """Shared logic for list_designs and list_circuits."""
+    page = await _get_page()
+    await _navigate(page, url)
+    await _random_delay(0.5, 1.0)
+
+    cards = await page.query_selector_all(SEL["design_cards"])
+    items = []
+    for card in cards:
+        # Title: <h3> inside tk-thing-box (no class)
+        title_el = await card.query_selector("h3")
+        title = (await title_el.inner_text()).strip() if title_el else "Untitled"
+
+        # ID: from thumbnail div id="thumbnail-{id}" or from href
+        thumb = await card.query_selector(SEL["design_card_thumb"])
+        design_id = ""
+        if thumb:
+            thumb_id = await thumb.get_attribute("id") or ""
+            design_id = thumb_id.replace("thumbnail-", "")
+        if not design_id:
+            link = await card.query_selector("a[href*='/things/']")
+            if link:
+                href = await link.get_attribute("href") or ""
+                m = re.search(r"/things/([^/-]+)", href)
+                design_id = m.group(1) if m else ""
+
+        items.append({"id": design_id, "name": title})
+    return items
+
+
 async def list_designs() -> str:
     """Return all 3D designs on the user's dashboard as JSON."""
     try:
-        page = await _get_page()
-        await _navigate(page, TINKERCAD_DASHBOARD)
-
-        # Click "3D Designs" tab if present
-        tab = await page.query_selector(SEL["tab_3d"])
-        if tab:
-            await tab.click()
-            await _random_delay()
-
-        cards = await page.query_selector_all(SEL["design_cards"])
-        designs = []
-        for card in cards:
-            title_el = await card.query_selector(SEL["design_card_title"])
-            title = (await title_el.inner_text()).strip() if title_el else "Untitled"
-
-            # Extract design ID from href or data-id attribute
-            design_id = await card.get_attribute("data-id") or ""
-            if not design_id:
-                link = await card.query_selector("a[href*='/things/']")
-                if link:
-                    href = await link.get_attribute("href") or ""
-                    m = re.search(r"/things/([^/]+)", href)
-                    design_id = m.group(1) if m else ""
-
-            designs.append({"id": design_id, "name": title})
-
-        return json.dumps({"count": len(designs), "designs": designs}, indent=2)
+        items = await _list_items_from_dashboard(
+            f"{TINKERCAD_BASE}/dashboard/designs/3d", "designs"
+        )
+        return json.dumps({"count": len(items), "designs": items}, indent=2)
     except Exception as exc:
         return f"Error listing designs: {exc}"
+
+
+async def _open_create_dropdown(page) -> bool:
+    """Click the '+Create' button to open the type-selection dropdown.
+    Returns True if dropdown opened successfully."""
+    btn = await page.query_selector(SEL["btn_create_dropdown"])
+    if not btn:
+        return False
+    await btn.click()
+    await _random_delay(0.3, 0.6)
+    return True
 
 
 async def create_3d_design(name: str) -> str:
     """Create a new blank 3D design with the given name."""
     try:
         page = await _get_page()
-        await _navigate(page, TINKERCAD_DASHBOARD)
+        await _navigate(page, f"{TINKERCAD_BASE}/dashboard/designs")
+
+        if not await _open_create_dropdown(page):
+            return "Error: '+Create' button not found. Make sure you're logged in."
 
         btn = await page.query_selector(SEL["btn_create_design"])
         if not btn:
-            return "Error: 'Create new design' button not found. Make sure you're logged in."
+            return "Error: '3D Design' option not found in Create dropdown."
         await btn.click()
 
-        # Wait for the editor to load
-        await page.wait_for_url(f"{TINKERCAD_BASE}/**", timeout=30_000)
-        await _random_delay(1.0, 2.0)
+        # Wait for 3D editor to load
+        await page.wait_for_url(f"{TINKERCAD_BASE}/things/**", timeout=30_000)
+        await _random_delay(1.5, 2.5)
 
-        # Rename if the editor exposes a name field
+        # Rename via editor title input
         name_input = await page.query_selector(SEL["design_name_input"])
         if name_input:
             await name_input.triple_click()
@@ -170,7 +191,7 @@ async def create_3d_design(name: str) -> str:
             await _random_delay()
 
         url = page.url
-        m = re.search(r"/things/([^/]+)", url)
+        m = re.search(r"/things/([^/-]+)", url)
         design_id = m.group(1) if m else "unknown"
 
         return json.dumps({"id": design_id, "name": name, "url": url})
@@ -288,22 +309,33 @@ async def delete_design(design_id: str) -> str:
     """Delete a 3D design by ID."""
     try:
         page = await _get_page()
-        await _navigate(page, TINKERCAD_DASHBOARD)
+        await _navigate(page, f"{TINKERCAD_BASE}/dashboard/designs")
 
-        # Find the design card and open its context menu / delete button
-        card = await page.query_selector(f"[data-id='{design_id}']")
+        # Find card by thumbnail id="thumbnail-{design_id}"
+        card = await page.query_selector(f"#thumbnail-{design_id}")
         if not card:
             return f"Error: Design {design_id} not found on dashboard."
 
+        # Hover to reveal the card menu button
         await card.hover()
         await _random_delay()
 
-        delete_btn = await card.query_selector(SEL["btn_delete_design"])
-        if not delete_btn:
-            return f"Error: Delete button not found for design {design_id}."
-        await delete_btn.click()
+        # Per-card "Design actions" gear button → click to open dropdown
+        card_box = await card.evaluate_handle("el => el.closest('tk-thing-box')")
+        menu_btn = await card_box.query_selector(SEL["btn_card_menu"])
+        if not menu_btn:
+            return f"Error: Design actions button not found for design {design_id}."
+        await menu_btn.click()
+        await _random_delay(0.3, 0.6)
+
+        # Click Delete item in dropdown
+        delete_item = await page.query_selector(SEL["btn_delete_design"])
+        if not delete_item:
+            return f"Error: Delete option not found in dropdown for design {design_id}."
+        await delete_item.click()
         await _random_delay()
 
+        # Confirm delete modal
         confirm = await page.query_selector(SEL["btn_confirm_delete"])
         if confirm:
             await confirm.click()
@@ -320,23 +352,10 @@ async def delete_design(design_id: str) -> str:
 async def list_circuits() -> str:
     """Return all circuits on the user's dashboard as JSON."""
     try:
-        page = await _get_page()
-        await _navigate(page, TINKERCAD_DASHBOARD)
-
-        tab = await page.query_selector(SEL["tab_circuits"])
-        if tab:
-            await tab.click()
-            await _random_delay()
-
-        cards = await page.query_selector_all(SEL["design_cards"])
-        circuits = []
-        for card in cards:
-            title_el = await card.query_selector(SEL["design_card_title"])
-            title = (await title_el.inner_text()).strip() if title_el else "Untitled"
-            cid = await card.get_attribute("data-id") or ""
-            circuits.append({"id": cid, "name": title})
-
-        return json.dumps({"count": len(circuits), "circuits": circuits}, indent=2)
+        items = await _list_items_from_dashboard(
+            f"{TINKERCAD_BASE}/dashboard/designs/circuits", "circuits"
+        )
+        return json.dumps({"count": len(items), "circuits": items}, indent=2)
     except Exception as exc:
         return f"Error listing circuits: {exc}"
 
@@ -345,18 +364,16 @@ async def create_circuit(name: str) -> str:
     """Create a new blank circuit."""
     try:
         page = await _get_page()
-        await _navigate(page, TINKERCAD_DASHBOARD)
+        await _navigate(page, f"{TINKERCAD_BASE}/dashboard/designs")
 
-        tab = await page.query_selector(SEL["tab_circuits"])
-        if tab:
-            await tab.click()
-            await _random_delay()
+        if not await _open_create_dropdown(page):
+            return "Error: '+Create' button not found. Make sure you're logged in."
 
         btn = await page.query_selector(SEL["btn_create_circuit"])
         if not btn:
-            return "Error: 'Create new circuit' button not found. Make sure you're logged in."
+            return "Error: 'Circuits' option not found in Create dropdown."
         await btn.click()
-        await page.wait_for_url(f"{TINKERCAD_BASE}/**", timeout=30_000)
+        await page.wait_for_url(f"{TINKERCAD_BASE}/things/**", timeout=30_000)
         await _random_delay(1.0, 2.0)
 
         name_input = await page.query_selector(SEL["design_name_input"])
