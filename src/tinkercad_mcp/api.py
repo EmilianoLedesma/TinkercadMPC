@@ -50,8 +50,8 @@ async def _is_logged_in(page: Page) -> bool:
         return False
 
 
-async def _navigate(page: Page, url: str, *, wait: str = "networkidle") -> None:
-    await page.goto(url, wait_until=wait)
+async def _navigate(page: Page, url: str, *, wait: str = "load", timeout: int = 60_000) -> None:
+    await page.goto(url, wait_until=wait, timeout=timeout)
     await _random_delay()
 
 
@@ -186,8 +186,8 @@ async def create_3d_design(name: str) -> str:
         # Rename via editor title input
         name_input = await page.query_selector(SEL["design_name_input"])
         if name_input:
-            await name_input.triple_click()
-            await name_input.type(name)
+            await name_input.click(click_count=3)
+            await name_input.fill(name)
             await page.keyboard.press("Enter")
             await _random_delay()
 
@@ -385,8 +385,8 @@ async def create_circuit(name: str) -> str:
             await _random_delay(0.3, 0.5)
             name_input = await page.query_selector(SEL["circuit_title_input"])
             if name_input:
-                await name_input.triple_click()
-                await name_input.type(name)
+                await name_input.click(click_count=3)
+                await name_input.fill(name)
                 await page.keyboard.press("Enter")
                 await _random_delay()
 
@@ -419,15 +419,32 @@ async def add_component(component_type: str, x: float, y: float) -> str:
         if not search:
             return "Error: Component search panel not found. Is a circuit open?"
         await search.click()
-        await search.fill("")
-        await search.type(search_term)
+        # Use page.fill (Locator-based) to reliably type + trigger autocomplete events
+        await page.fill(SEL["component_search"], search_term)
         await _random_delay(0.5, 1.0)
 
-        # Click first autocomplete suggestion to filter the panel grid
-        autocomplete_item = await page.query_selector(SEL["component_autocomplete_item"])
-        if not autocomplete_item:
+        # Click the autocomplete item that exactly matches search_term (case-insensitive)
+        # First item is not always the right one (e.g. "photoresistor" before "resistor")
+        exact_item = await page.evaluate(
+            """
+            (term) => {
+                const items = document.querySelectorAll('ul.ui-autocomplete li.ui-menu-item');
+                const t = term.toLowerCase();
+                for (const li of items) {
+                    if (li.innerText.trim().toLowerCase() === t) {
+                        li.click();
+                        return true;
+                    }
+                }
+                // Fallback: click first item if no exact match
+                if (items.length > 0) { items[0].click(); return 'fallback'; }
+                return false;
+            }
+            """,
+            search_term.lower(),
+        )
+        if not exact_item:
             return f"Error: No autocomplete results for '{search_term}'. Check spelling."
-        await autocomplete_item.click()
         await _random_delay(0.4, 0.7)
 
         # Get first VISIBLE grid item bounding box via JS (hidden items have bbox 0,0)

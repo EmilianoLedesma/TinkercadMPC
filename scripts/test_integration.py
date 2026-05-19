@@ -2,7 +2,7 @@
 End-to-end integration test — creates a circuit and adds LED, Resistor, Arduino.
 
 Usage:
-    .venv\Scripts\python.exe scripts\test_integration.py
+    .venv/Scripts/python.exe scripts/test_integration.py
 """
 import asyncio
 import os
@@ -13,11 +13,11 @@ os.environ["TINKERCAD_HEADLESS"] = "false"  # headed so user can watch
 
 import tinkercad_mcp.api as api
 
-SEP = "─" * 55
+SEP = "-" * 55
 
 def log(label: str, result: str) -> None:
-    ok = "✓" if "error" not in result.lower() else "✗"
-    print(f"\n{ok} [{label}]\n  {result[:200]}")
+    ok = "OK" if "error" not in result.lower() else "FAIL"
+    print(f"\n[{ok}] [{label}]\n  {result[:200]}")
 
 
 async def main() -> None:
