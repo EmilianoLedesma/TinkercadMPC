@@ -423,14 +423,31 @@ async def add_component(component_type: str, x: float, y: float) -> str:
         await search.type(search_term)
         await _random_delay(0.5, 1.0)
 
-        # First search result: Tinkercad renders them as draggable list items
-        first_result = await page.query_selector(
-            ".ui-autocomplete li:first-child, "
-            "[class*='search_result']:first-child, "
-            ".components-list li:first-child"
-        )
-        if not first_result:
-            return f"Error: No component results for '{search_term}'. Check spelling."
+        # Click first autocomplete suggestion to filter the panel grid
+        autocomplete_item = await page.query_selector(SEL["component_autocomplete_item"])
+        if not autocomplete_item:
+            return f"Error: No autocomplete results for '{search_term}'. Check spelling."
+        await autocomplete_item.click()
+        await _random_delay(0.4, 0.7)
+
+        # Get first VISIBLE grid item bounding box via JS (hidden items have bbox 0,0)
+        grid_bbox = await page.evaluate("""
+            () => {
+                const items = document.querySelectorAll(
+                    'div.editor__component_picker__groups__item.grid__item'
+                );
+                for (const el of items) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) {
+                        return { x: r.x, y: r.y, width: r.width, height: r.height,
+                                 dataDid: el.getAttribute('data-did') };
+                    }
+                }
+                return null;
+            }
+        """)
+        if not grid_bbox:
+            return f"Error: No visible component grid item for '{search_term}'."
 
         canvas = await page.query_selector(SEL["circuit_canvas"])
         if not canvas:
@@ -440,24 +457,27 @@ async def add_component(component_type: str, x: float, y: float) -> str:
         if not canvas_box:
             return "Error: Could not get canvas bounding box."
 
-        result_box = await first_result.bounding_box()
-        if not result_box:
-            return "Error: Could not get search result bounding box."
-
-        src_x = result_box["x"] + result_box["width"] / 2
-        src_y = result_box["y"] + result_box["height"] / 2
+        src_x = grid_bbox["x"] + grid_bbox["width"] / 2
+        src_y = grid_bbox["y"] + grid_bbox["height"] / 2
         dst_x = canvas_box["x"] + x
         dst_y = canvas_box["y"] + y
 
-        # Drag from result list onto canvas
+        # Playwright native mouse drag — more reliable than JS dispatchEvent
         await page.mouse.move(src_x, src_y)
         await page.mouse.down()
-        await _random_delay(0.2, 0.4)
-        await page.mouse.move(dst_x, dst_y, steps=10)
+        await _random_delay(0.2, 0.3)
+        # Move gradually so Tinkercad's drag handler tracks correctly
+        await page.mouse.move(dst_x, dst_y, steps=15)
+        await _random_delay(0.1, 0.2)
         await page.mouse.up()
         await _random_delay(0.5, 1.0)
 
-        return json.dumps({"component": component_type, "search_term": search_term, "x": x, "y": y})
+        return json.dumps({
+            "component": component_type,
+            "search_term": search_term,
+            "data_did": grid_bbox.get("dataDid"),
+            "x": x, "y": y,
+        })
     except Exception as exc:
         return f"Error adding component: {exc}"
 
@@ -465,57 +485,129 @@ async def add_component(component_type: str, x: float, y: float) -> str:
 async def connect_pins(comp_a: str, pin_a: str, comp_b: str, pin_b: str) -> str:
     """Connect two component pins with a wire.
 
-    Note: Tinkercad renders the circuit canvas as a bitmap with an SVG overlay.
-    Pin positions are identified via SVG title elements or data attributes.
+    Tinkercad renders the circuit on an HTML5 canvas — pins are not standard DOM
+    elements. Connection is done by clicking on the source pin position and
+    dragging to the destination pin position (canvas pixel coordinates).
+
+    To find pin coordinates:
+    1. Call get_component_pin_positions(comp_id) to get a map of pin names → coords.
+    2. Pass those coords here.
 
     Args:
-        comp_a: Component index or label (as shown in Code panel dropdown, e.g. '1')
-        pin_a: Pin name (e.g. 'GND', 'D13', '~5V', 'Anode')
-        comp_b: Component index or label
-        pin_b: Pin name
+        comp_a: Source component identifier (data-did, e.g. '58422' for LED)
+        pin_a: Source pin name (e.g. 'Anode', 'Cathode', 'GND', 'D13')
+        comp_b: Destination component identifier
+        pin_b: Destination pin name
     """
     try:
         page = await _get_page()
 
-        # Pins are SVG elements with title or data-label attributes
-        src_pin = await page.query_selector(
-            f"[data-component-id='{comp_a}'] [data-pin='{pin_a}'], "
-            f"svg [title='{pin_a}'], [data-label='{pin_a}']"
-        )
-        if not src_pin:
-            return (
-                f"Error: Pin '{pin_a}' not found on component '{comp_a}'. "
-                "Pin selectors for Tinkercad circuit canvas need further mapping — "
-                "open the circuit editor in headed mode and inspect SVG elements."
+        # Try to resolve pin positions via circuit_editor internal model
+        pin_coords = await page.evaluate("""
+            ([compA, pinA, compB, pinB]) => {
+                try {
+                    const root = window.circuit_editor?.root;
+                    if (!root) return null;
+                    // objectMap maps local IDs to circuit objects
+                    // Components store pin positions in their data
+                    // This requires deeper mapping — placeholder for now
+                    return null;
+                } catch(e) { return null; }
+            }
+        """, [comp_a, pin_a, comp_b, pin_b])
+
+        if pin_coords:
+            sx, sy = pin_coords["src"]["x"], pin_coords["src"]["y"]
+            dx, dy = pin_coords["dst"]["x"], pin_coords["dst"]["y"]
+        else:
+            # Fallback: try SVG overlay elements (present in some Tinkercad versions)
+            src_el = await page.query_selector(
+                f"[data-did='{comp_a}'] [data-pin='{pin_a}'], "
+                f"[data-component='{comp_a}'] [title='{pin_a}']"
+            )
+            dst_el = await page.query_selector(
+                f"[data-did='{comp_b}'] [data-pin='{pin_b}'], "
+                f"[data-component='{comp_b}'] [title='{pin_b}']"
             )
 
-        dst_pin = await page.query_selector(
-            f"[data-component-id='{comp_b}'] [data-pin='{pin_b}'], "
-            f"svg [title='{pin_b}'], [data-label='{pin_b}']"
-        )
-        if not dst_pin:
-            return f"Error: Pin '{pin_b}' not found on component '{comp_b}'."
+            if not src_el or not dst_el:
+                return (
+                    f"Error: Cannot resolve pin positions for "
+                    f"'{comp_a}:{pin_a}' → '{comp_b}:{pin_b}'. "
+                    "Use tinkercad_get_pin_positions to get canvas coordinates, "
+                    "then call tinkercad_connect_pins_by_coords."
+                )
 
-        src_box = await src_pin.bounding_box()
-        dst_box = await dst_pin.bounding_box()
-        if not src_box or not dst_box:
-            return "Error: Could not get pin bounding boxes."
+            src_box = await src_el.bounding_box()
+            dst_box = await dst_el.bounding_box()
+            if not src_box or not dst_box:
+                return "Error: Pin elements found but bounding boxes are zero."
 
-        sx = src_box["x"] + src_box["width"] / 2
-        sy = src_box["y"] + src_box["height"] / 2
-        dx = dst_box["x"] + dst_box["width"] / 2
-        dy = dst_box["y"] + dst_box["height"] / 2
+            sx = src_box["x"] + src_box["width"] / 2
+            sy = src_box["y"] + src_box["height"] / 2
+            dx = dst_box["x"] + dst_box["width"] / 2
+            dy = dst_box["y"] + dst_box["height"] / 2
 
-        await page.mouse.move(sx, sy)
+        canvas = await page.query_selector(SEL["circuit_canvas"])
+        if not canvas:
+            return "Error: Circuit canvas not found."
+        canvas_box = await canvas.bounding_box()
+        if not canvas_box:
+            return "Error: Could not get canvas bounding box."
+
+        # Click source pin, drag to destination pin
+        await page.mouse.move(canvas_box["x"] + sx, canvas_box["y"] + sy)
         await page.mouse.down()
-        await _random_delay(0.1, 0.3)
-        await page.mouse.move(dx, dy, steps=10)
+        await _random_delay(0.1, 0.2)
+        await page.mouse.move(
+            canvas_box["x"] + dx,
+            canvas_box["y"] + dy,
+            steps=15,
+        )
         await page.mouse.up()
         await _random_delay()
 
         return json.dumps({"wire": f"{comp_a}:{pin_a} → {comp_b}:{pin_b}"})
     except Exception as exc:
         return f"Error connecting pins: {exc}"
+
+
+async def connect_pins_by_coords(
+    src_x: float, src_y: float, dst_x: float, dst_y: float
+) -> str:
+    """Connect two pins using raw canvas pixel coordinates.
+
+    Use this when you know the exact pixel positions of the pins on the canvas.
+    Coordinates are relative to the canvas origin (top-left corner).
+
+    Args:
+        src_x, src_y: Source pin position on canvas
+        dst_x, dst_y: Destination pin position on canvas
+    """
+    try:
+        page = await _get_page()
+        canvas = await page.query_selector(SEL["circuit_canvas"])
+        if not canvas:
+            return "Error: Circuit canvas not found. Is a circuit open?"
+
+        canvas_box = await canvas.bounding_box()
+        if not canvas_box:
+            return "Error: Could not get canvas bounding box."
+
+        ox, oy = canvas_box["x"], canvas_box["y"]
+
+        await page.mouse.move(ox + src_x, oy + src_y)
+        await page.mouse.down()
+        await _random_delay(0.1, 0.2)
+        await page.mouse.move(ox + dst_x, oy + dst_y, steps=15)
+        await page.mouse.up()
+        await _random_delay()
+
+        return json.dumps({
+            "wire": f"({src_x},{src_y}) → ({dst_x},{dst_y})",
+        })
+    except Exception as exc:
+        return f"Error connecting pins by coords: {exc}"
 
 
 async def add_code_to_arduino(comp_id: str, sketch: str) -> str:

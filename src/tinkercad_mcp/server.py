@@ -389,6 +389,43 @@ async def tinkercad_connect_pins(params: ConnectPinsInput) -> str:
     return await api.connect_pins(params.comp_a, params.pin_a, params.comp_b, params.pin_b)
 
 
+class ConnectByCoordsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    src_x: float = Field(..., description="Source pin X position on canvas (pixels from left)")
+    src_y: float = Field(..., description="Source pin Y position on canvas (pixels from top)")
+    dst_x: float = Field(..., description="Destination pin X position on canvas (pixels from left)")
+    dst_y: float = Field(..., description="Destination pin Y position on canvas (pixels from top)")
+
+
+@mcp.tool(
+    name="tinkercad_connect_pins_by_coords",
+    annotations={
+        "title": "Connect Pins by Canvas Coordinates",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def tinkercad_connect_pins_by_coords(params: ConnectByCoordsInput) -> str:
+    """Connect two pins using raw canvas pixel coordinates.
+
+    Use when tinkercad_connect_pins cannot resolve pin DOM elements.
+    Coordinates are relative to the canvas top-left corner.
+
+    Args:
+        params.src_x, params.src_y: Source pin position on canvas
+        params.dst_x, params.dst_y: Destination pin position on canvas
+
+    Returns:
+        str: JSON confirmation or error.
+    """
+    return await api.connect_pins_by_coords(
+        params.src_x, params.src_y, params.dst_x, params.dst_y
+    )
+
+
 @mcp.tool(
     name="tinkercad_add_code_to_arduino",
     annotations={

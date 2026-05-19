@@ -76,7 +76,13 @@ SEL: dict[str, str] = {
     "circuit_canvas":       "canvas.js-tpl-target__render-canvas",
 
     # Component search box (right panel)
-    "component_search":     "input#q",
+    "component_search":      "input#q",
+
+    # Autocomplete dropdown result items (appear after typing in search)
+    "component_autocomplete_item": "ul.ui-autocomplete li.ui-menu-item",
+
+    # Component grid items in panel after autocomplete selection
+    "component_grid_item":   "div.editor__component_picker__groups__item.grid__item",
 
     # Start/Stop simulation — same element, text toggles between states
     "btn_start_sim":        "a#SIMULATION_ID",

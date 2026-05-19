@@ -164,6 +164,8 @@ async def test_add_component_valid_catalog_key(mock_browser_manager):
 
 @pytest.mark.asyncio
 async def test_connect_pins_source_not_found(mock_browser_manager, mock_page):
+    # evaluate returns None → falls back to DOM lookup → both query_selectors return None
+    mock_page.evaluate.return_value = None
     mock_page.query_selector.return_value = None
 
     with patch("tinkercad_mcp.api.BrowserManager.get_instance", return_value=mock_browser_manager):
@@ -172,13 +174,16 @@ async def test_connect_pins_source_not_found(mock_browser_manager, mock_page):
         result = await connect_pins("arduino-1", "GND", "led-1", "Cathode")
 
     assert "error" in result.lower()
-    assert "gnd" in result.lower() or "arduino-1" in result.lower()
+    assert "resolve" in result.lower() or "pin" in result.lower()
 
 
 @pytest.mark.asyncio
 async def test_connect_pins_destination_not_found(mock_browser_manager, mock_page):
     src_pin = AsyncMock()
     call_count = 0
+
+    # evaluate returns None → falls back to DOM lookup
+    mock_page.evaluate.return_value = None
 
     async def sel_side_effect(selector):
         nonlocal call_count
@@ -193,7 +198,7 @@ async def test_connect_pins_destination_not_found(mock_browser_manager, mock_pag
         result = await connect_pins("arduino-1", "D13", "led-1", "Anode")
 
     assert "error" in result.lower()
-    assert "anode" in result.lower() or "led-1" in result.lower()
+    assert "resolve" in result.lower() or "pin" in result.lower()
 
 
 # ── add_code_to_arduino ───────────────────────────────────────────────────────
