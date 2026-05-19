@@ -441,6 +441,29 @@ async def tinkercad_connect_pins_by_coords(params: ConnectByCoordsInput) -> str:
 
 
 @mcp.tool(
+    name="tinkercad_get_component_pins",
+    annotations={
+        "title": "Get Component Pin Positions",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def tinkercad_get_component_pins() -> str:
+    """Scan the circuit canvas and return pin positions for each detected component.
+
+    Groups interactive SVG pins by proximity. Excludes breadboard holes and
+    Arduino header rows (>8 pins). Call this to discover which canvas coordinates
+    to pass to tinkercad_connect_pins_by_coords.
+
+    Returns:
+        str: JSON list [{"id":"comp_0","pin_count":2,"pins":[{"x":int,"y":int}],"center":{...}}]
+    """
+    return await api.get_component_pins()
+
+
+@mcp.tool(
     name="tinkercad_get_breadboard_grid",
     annotations={
         "title": "Get Breadboard Grid",

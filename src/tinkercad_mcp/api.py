@@ -611,10 +611,6 @@ async def connect_pins_by_coords(
                 if (!canvas) return { error: 'no canvas' };
                 const cr = canvas.getBoundingClientRect();
 
-                // Canvas-relative → screen coords
-                const ssx = cr.x + sx, ssy = cr.y + sy;
-                const dsx = cr.x + dx, dsy = cr.y + dy;
-
                 const fire = (el, type, x, y) => {
                     if (!el) return;
                     jQuery(el).trigger(jQuery.Event(type, {
@@ -622,16 +618,43 @@ async def connect_pins_by_coords(
                     }));
                 };
 
+                // Find nearest SVG rect/circle with mousedown handler to a screen point.
+                // This tolerates small view shifts after prior wires.
+                const findNearestPin = (targetScreenX, targetScreenY, radiusPx = 20) => {
+                    const allPins = Array.from(document.querySelectorAll('svg rect, svg circle'))
+                        .filter(el => {
+                            try { return Object.keys(jQuery._data(el, 'events') || {}).includes('mousedown'); }
+                            catch(e) { return false; }
+                        });
+                    let best = null, bestDist = Infinity;
+                    for (const el of allPins) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width === 0) continue;
+                        const cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+                        const d = Math.hypot(cx - targetScreenX, cy - targetScreenY);
+                        if (d < bestDist && d <= radiusPx) { best = el; bestDist = d; }
+                    }
+                    return best;
+                };
+
+                // Canvas-relative → screen coords
+                const ssx = cr.x + sx, ssy = cr.y + sy;
+                const dsx = cr.x + dx, dsy = cr.y + dy;
+
                 // ESC to cancel any in-progress wire
                 document.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 27, bubbles: true }));
                 await new Promise(r => setTimeout(r, 200));
 
-                // Click 1 — start wire at source
-                const srcEl = document.elementFromPoint(ssx, ssy);
-                fire(srcEl, 'mousedown', ssx, ssy);
+                // Click 1 — start wire at source (prefer exact element, fall back to nearest pin)
+                const srcEl = findNearestPin(ssx, ssy) || document.elementFromPoint(ssx, ssy);
+                const srcR = srcEl?.getBoundingClientRect();
+                const srcX = srcR ? srcR.x + srcR.width / 2 : ssx;
+                const srcY = srcR ? srcR.y + srcR.height / 2 : ssy;
+
+                fire(srcEl, 'mousedown', srcX, srcY);
                 await new Promise(r => setTimeout(r, 80));
-                fire(srcEl, 'mouseup', ssx, ssy);
-                fire(srcEl, 'click', ssx, ssy);
+                fire(srcEl, 'mouseup', srcX, srcY);
+                fire(srcEl, 'click', srcX, srcY);
                 await new Promise(r => setTimeout(r, 400));
 
                 // Move preview to destination
@@ -639,15 +662,19 @@ async def connect_pins_by_coords(
                 await new Promise(r => setTimeout(r, 200));
 
                 // Click 2 — complete wire at destination
-                const dstEl = document.elementFromPoint(dsx, dsy);
-                fire(dstEl, 'mousedown', dsx, dsy);
+                const dstEl = findNearestPin(dsx, dsy) || document.elementFromPoint(dsx, dsy);
+                const dstR = dstEl?.getBoundingClientRect();
+                const dstX = dstR ? dstR.x + dstR.width / 2 : dsx;
+                const dstY = dstR ? dstR.y + dstR.height / 2 : dsy;
+
+                fire(dstEl, 'mousedown', dstX, dstY);
                 await new Promise(r => setTimeout(r, 80));
-                fire(dstEl, 'mouseup', dsx, dsy);
-                fire(dstEl, 'click', dsx, dsy);
+                fire(dstEl, 'mouseup', dstX, dstY);
+                fire(dstEl, 'click', dstX, dstY);
 
                 return {
-                    src: { x: sx, y: sy, screen_x: ssx, screen_y: ssy, el: srcEl?.tagName },
-                    dst: { x: dx, y: dy, screen_x: dsx, screen_y: dsy, el: dstEl?.tagName },
+                    src: { canvas: {x:sx,y:sy}, el: srcEl?.tagName, hit: {x:srcX,y:srcY} },
+                    dst: { canvas: {x:dx,y:dy}, el: dstEl?.tagName, hit: {x:dstX,y:dstY} },
                 };
             }
             """,
@@ -661,6 +688,100 @@ async def connect_pins_by_coords(
         return json.dumps({"wire": f"({src_x},{src_y}) → ({dst_x},{dst_y})"})
     except Exception as exc:
         return f"Error connecting pins by coords: {exc}"
+
+
+async def get_component_pins() -> str:
+    """Scan the canvas SVG for interactive component pins and group them by proximity.
+
+    Returns canvas-relative coordinates for each detected component's pins.
+    Excludes breadboard holes. Groups pins within 60px of each other as one component.
+
+    Returns:
+        JSON list of components: [{"id": "comp_0", "pins": [{"x":int,"y":int}, ...]}]
+    """
+    try:
+        page = await _get_page()
+
+        data = await page.evaluate("""
+            () => {
+                const canvas = document.querySelector('canvas.js-tpl-target__render-canvas');
+                if (!canvas) return null;
+                const cr = canvas.getBoundingClientRect();
+
+                // All interactive SVG rects/circles with mousedown handler
+                const els = Array.from(document.querySelectorAll('svg rect, svg circle'))
+                    .filter(el => {
+                        try { return Object.keys(jQuery._data(el, 'events') || {}).includes('mousedown'); }
+                        catch(e) { return false; }
+                    });
+
+                // Collect canvas-relative positions
+                const pts = [];
+                for (const el of els) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0) continue;
+                    const cx = Math.round(r.x + r.width / 2 - cr.x);
+                    const cy = Math.round(r.y + r.height / 2 - cr.y);
+                    // Skip breadboard area (large x range, many holes at same y)
+                    if (cx > 420) continue;
+                    pts.push({ x: cx, y: cy, w: Math.round(r.width) });
+                }
+
+                // Group by y-row buckets (same cy ± 5 = same row)
+                const rows = {};
+                for (const p of pts) {
+                    const bucket = Math.round(p.y / 10) * 10;
+                    if (!rows[bucket]) rows[bucket] = [];
+                    rows[bucket].push(p);
+                }
+
+                // Filter out Arduino pin headers (rows with > 8 pins)
+                const componentPins = [];
+                for (const [bucket, rowPts] of Object.entries(rows)) {
+                    if (rowPts.length <= 8) {
+                        componentPins.push(...rowPts);
+                    }
+                }
+
+                // Proximity clustering: group pins within 60px of each other
+                const clusters = [];
+                const used = new Set();
+                for (let i = 0; i < componentPins.length; i++) {
+                    if (used.has(i)) continue;
+                    const cluster = [componentPins[i]];
+                    used.add(i);
+                    for (let j = i + 1; j < componentPins.length; j++) {
+                        if (used.has(j)) continue;
+                        const dist = Math.hypot(
+                            componentPins[i].x - componentPins[j].x,
+                            componentPins[i].y - componentPins[j].y
+                        );
+                        if (dist <= 60) { cluster.push(componentPins[j]); used.add(j); }
+                    }
+                    clusters.push(cluster);
+                }
+
+                // Build output: sort pins within cluster by x then y
+                return clusters.map((pins, idx) => ({
+                    id: `comp_${idx}`,
+                    pin_count: pins.length,
+                    pins: pins
+                        .sort((a, b) => a.x - b.x || a.y - b.y)
+                        .map(p => ({ x: p.x, y: p.y })),
+                    center: {
+                        x: Math.round(pins.reduce((s, p) => s + p.x, 0) / pins.length),
+                        y: Math.round(pins.reduce((s, p) => s + p.y, 0) / pins.length),
+                    },
+                }));
+            }
+        """)
+
+        if not data:
+            return "Error: No component pins found. Is a circuit open?"
+
+        return json.dumps(data, indent=2)
+    except Exception as exc:
+        return f"Error scanning component pins: {exc}"
 
 
 async def get_breadboard_grid() -> str:
