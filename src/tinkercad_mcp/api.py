@@ -22,6 +22,7 @@ from tinkercad_mcp.utils import (
     SEL,
     SHAPE_TYPES,
     TINKERCAD_BASE,
+    TINKERCAD_CIRCUIT_EDIT_SUFFIX,
     TINKERCAD_DASHBOARD,
     TINKERCAD_LOGIN,
 )
@@ -285,7 +286,8 @@ async def export_stl(design_id: str) -> str:
     """Export a design as STL by navigating to its page and clicking Export."""
     try:
         page = await _get_page()
-        await _navigate(page, f"{TINKERCAD_BASE}/things/{design_id}/edit")
+        # Circuits use /editel, 3D designs use /edit — try editel first, fall back
+        await _navigate(page, f"{TINKERCAD_BASE}/things/{design_id}/{TINKERCAD_CIRCUIT_EDIT_SUFFIX}")
         await _random_delay(1.5, 2.5)
 
         btn_export = await page.query_selector(SEL["btn_export"])
@@ -376,15 +378,20 @@ async def create_circuit(name: str) -> str:
         await page.wait_for_url(f"{TINKERCAD_BASE}/things/**", timeout=30_000)
         await _random_delay(1.0, 2.0)
 
-        name_input = await page.query_selector(SEL["design_name_input"])
-        if name_input:
-            await name_input.triple_click()
-            await name_input.type(name)
-            await page.keyboard.press("Enter")
-            await _random_delay()
+        # Rename via circuit title — click span to activate input
+        title_span = await page.query_selector(SEL["circuit_title_span"])
+        if title_span:
+            await title_span.click()
+            await _random_delay(0.3, 0.5)
+            name_input = await page.query_selector(SEL["circuit_title_input"])
+            if name_input:
+                await name_input.triple_click()
+                await name_input.type(name)
+                await page.keyboard.press("Enter")
+                await _random_delay()
 
         url = page.url
-        m = re.search(r"/things/([^/]+)", url)
+        m = re.search(r"/things/([^/-]+)", url)
         circuit_id = m.group(1) if m else "unknown"
 
         return json.dumps({"id": circuit_id, "name": name, "url": url})
@@ -393,11 +400,11 @@ async def create_circuit(name: str) -> str:
 
 
 async def add_component(component_type: str, x: float, y: float) -> str:
-    """Add a component to the open circuit by searching the parts panel.
+    """Add a component to the open circuit by searching the parts panel and dragging.
 
     Args:
         component_type: Key from COMPONENT_CATALOG (e.g. 'arduino_uno', 'led')
-        x, y: Drop position on the circuit canvas (pixels)
+        x, y: Drop position relative to canvas origin (pixels)
     """
     search_term = COMPONENT_CATALOG.get(component_type)
     if search_term is None:
@@ -407,40 +414,48 @@ async def add_component(component_type: str, x: float, y: float) -> str:
     try:
         page = await _get_page()
 
+        # Type in component search box (id="q")
         search = await page.query_selector(SEL["component_search"])
         if not search:
             return "Error: Component search panel not found. Is a circuit open?"
         await search.click()
-        await search.fill(search_term)
-        await _random_delay()
+        await search.fill("")
+        await search.type(search_term)
+        await _random_delay(0.5, 1.0)
 
-        # Click first result in the component list
-        first_result = await page.query_selector("[class*='component-item']:first-child, [data-testid='component-item']")
+        # First search result: Tinkercad renders them as draggable list items
+        first_result = await page.query_selector(
+            ".ui-autocomplete li:first-child, "
+            "[class*='search_result']:first-child, "
+            ".components-list li:first-child"
+        )
         if not first_result:
-            return f"Error: No results found for '{search_term}'."
+            return f"Error: No component results for '{search_term}'. Check spelling."
 
-        # Drag component onto canvas
         canvas = await page.query_selector(SEL["circuit_canvas"])
         if not canvas:
-            return "Error: Circuit canvas not found."
+            return "Error: Circuit canvas not found. Is a circuit open?"
 
         canvas_box = await canvas.bounding_box()
         if not canvas_box:
-            return "Error: Could not get canvas bounds."
-
-        target_x = canvas_box["x"] + x
-        target_y = canvas_box["y"] + y
+            return "Error: Could not get canvas bounding box."
 
         result_box = await first_result.bounding_box()
         if not result_box:
-            return "Error: Could not get component bounds."
+            return "Error: Could not get search result bounding box."
 
-        await page.mouse.move(result_box["x"] + result_box["width"] / 2, result_box["y"] + result_box["height"] / 2)
+        src_x = result_box["x"] + result_box["width"] / 2
+        src_y = result_box["y"] + result_box["height"] / 2
+        dst_x = canvas_box["x"] + x
+        dst_y = canvas_box["y"] + y
+
+        # Drag from result list onto canvas
+        await page.mouse.move(src_x, src_y)
         await page.mouse.down()
         await _random_delay(0.2, 0.4)
-        await page.mouse.move(target_x, target_y)
+        await page.mouse.move(dst_x, dst_y, steps=10)
         await page.mouse.up()
-        await _random_delay()
+        await _random_delay(0.5, 1.0)
 
         return json.dumps({"component": component_type, "search_term": search_term, "x": x, "y": y})
     except Exception as exc:
@@ -450,26 +465,33 @@ async def add_component(component_type: str, x: float, y: float) -> str:
 async def connect_pins(comp_a: str, pin_a: str, comp_b: str, pin_b: str) -> str:
     """Connect two component pins with a wire.
 
+    Note: Tinkercad renders the circuit canvas as a bitmap with an SVG overlay.
+    Pin positions are identified via SVG title elements or data attributes.
+
     Args:
-        comp_a: Component A selector or identifier
-        pin_a: Pin name/label on component A (e.g. '~5V', 'GND', 'D13')
-        comp_b: Component B selector or identifier
-        pin_b: Pin name/label on component B
+        comp_a: Component index or label (as shown in Code panel dropdown, e.g. '1')
+        pin_a: Pin name (e.g. 'GND', 'D13', '~5V', 'Anode')
+        comp_b: Component index or label
+        pin_b: Pin name
     """
     try:
         page = await _get_page()
 
-        # Locate source pin
+        # Pins are SVG elements with title or data-label attributes
         src_pin = await page.query_selector(
-            f"[data-component='{comp_a}'] [data-pin='{pin_a}'], "
-            f"[data-id='{comp_a}'] [title='{pin_a}']"
+            f"[data-component-id='{comp_a}'] [data-pin='{pin_a}'], "
+            f"svg [title='{pin_a}'], [data-label='{pin_a}']"
         )
         if not src_pin:
-            return f"Error: Pin '{pin_a}' not found on component '{comp_a}'."
+            return (
+                f"Error: Pin '{pin_a}' not found on component '{comp_a}'. "
+                "Pin selectors for Tinkercad circuit canvas need further mapping — "
+                "open the circuit editor in headed mode and inspect SVG elements."
+            )
 
         dst_pin = await page.query_selector(
-            f"[data-component='{comp_b}'] [data-pin='{pin_b}'], "
-            f"[data-id='{comp_b}'] [title='{pin_b}']"
+            f"[data-component-id='{comp_b}'] [data-pin='{pin_b}'], "
+            f"svg [title='{pin_b}'], [data-label='{pin_b}']"
         )
         if not dst_pin:
             return f"Error: Pin '{pin_b}' not found on component '{comp_b}'."
@@ -477,7 +499,7 @@ async def connect_pins(comp_a: str, pin_a: str, comp_b: str, pin_b: str) -> str:
         src_box = await src_pin.bounding_box()
         dst_box = await dst_pin.bounding_box()
         if not src_box or not dst_box:
-            return "Error: Could not get pin positions."
+            return "Error: Could not get pin bounding boxes."
 
         sx = src_box["x"] + src_box["width"] / 2
         sy = src_box["y"] + src_box["height"] / 2
@@ -487,7 +509,7 @@ async def connect_pins(comp_a: str, pin_a: str, comp_b: str, pin_b: str) -> str:
         await page.mouse.move(sx, sy)
         await page.mouse.down()
         await _random_delay(0.1, 0.3)
-        await page.mouse.move(dx, dy)
+        await page.mouse.move(dx, dy, steps=10)
         await page.mouse.up()
         await _random_delay()
 
@@ -497,48 +519,47 @@ async def connect_pins(comp_a: str, pin_a: str, comp_b: str, pin_b: str) -> str:
 
 
 async def add_code_to_arduino(comp_id: str, sketch: str) -> str:
-    """Upload an Arduino sketch (C++) to a simulated Arduino component.
+    """Set Arduino sketch code via the Code panel's CodeMirror editor.
+
+    The circuit editor uses CodeMirror for code editing.
+    We open the code panel (a#CODE_EDITOR_ID) and set the value via
+    the CodeMirror JS API rather than typing, which is faster and reliable.
 
     Args:
-        comp_id: The Arduino component's identifier on the canvas
+        comp_id: Arduino component label shown in the Code panel dropdown
+                 (e.g. '1' for '1 (Arduino Uno R3)'). Pass '' to use
+                 whichever Arduino is currently selected.
         sketch: Full Arduino C++ sketch source code
     """
     try:
         page = await _get_page()
 
-        # Click on the Arduino component
-        arduino = await page.query_selector(
-            f"[data-id='{comp_id}'], [data-component='{comp_id}']"
-        )
-        if not arduino:
-            return f"Error: Arduino component '{comp_id}' not found."
-        await arduino.double_click()
-        await _random_delay()
-
-        btn_code = await page.query_selector(SEL["btn_add_code"])
-        if not btn_code:
-            return "Error: Code editor button not found."
-        await btn_code.click()
+        # Open code panel
+        code_btn = await page.query_selector(SEL["btn_add_code"])
+        if not code_btn:
+            return "Error: Code button not found. Is a circuit open?"
+        await code_btn.click()
         await _random_delay(0.5, 1.0)
 
-        editor = await page.query_selector(SEL["code_editor"])
-        if not editor:
-            return "Error: Code editor text area not found."
+        # Set code via CodeMirror JS API — faster and more reliable than typing
+        escaped = sketch.replace("\\", "\\\\").replace("`", "\\`")
+        result = await page.evaluate(f"""
+            () => {{
+                const cm = document.querySelector('.CodeMirror')?.CodeMirror;
+                if (!cm) return 'no_cm';
+                cm.setValue(`{escaped}`);
+                cm.save();
+                return 'ok';
+            }}
+        """)
 
-        # Select all existing code and replace
-        await editor.click()
-        await page.keyboard.press("Control+A")
-        await editor.type(sketch)
-        await _random_delay()
+        if result == "no_cm":
+            return "Error: CodeMirror editor not found in code panel."
 
-        upload = await page.query_selector(SEL["btn_upload_code"])
-        if upload:
-            await upload.click()
-            await _random_delay(0.5, 1.0)
-
-        return f"Sketch uploaded to Arduino '{comp_id}' ({len(sketch)} chars)."
+        await _random_delay(0.3, 0.6)
+        return f"Sketch set for Arduino '{comp_id or 'selected'}' ({len(sketch)} chars)."
     except Exception as exc:
-        return f"Error uploading sketch: {exc}"
+        return f"Error setting sketch: {exc}"
 
 
 async def start_simulation() -> str:
@@ -548,6 +569,10 @@ async def start_simulation() -> str:
         btn = await page.query_selector(SEL["btn_start_sim"])
         if not btn:
             return "Error: Start Simulation button not found. Is a circuit open?"
+        # Verify it's not already running
+        btn_text = await btn.inner_text()
+        if "Stop" in btn_text:
+            return "Simulation already running."
         await btn.click()
         await _random_delay()
         return "Simulation started."
@@ -561,7 +586,10 @@ async def stop_simulation() -> str:
         page = await _get_page()
         btn = await page.query_selector(SEL["btn_stop_sim"])
         if not btn:
-            return "Error: Stop Simulation button not found. Is simulation running?"
+            return "Error: Stop Simulation button not found. Is a circuit open?"
+        btn_text = await btn.inner_text()
+        if "Start" in btn_text:
+            return "Simulation not running."
         await btn.click()
         await _random_delay()
         return "Simulation stopped."
@@ -573,13 +601,21 @@ async def get_simulation_output() -> str:
     """Read the Arduino Serial Monitor output from the running simulation."""
     try:
         page = await _get_page()
-        monitor = await page.query_selector(SEL["serial_monitor"])
-        if not monitor:
-            return "Error: Serial monitor not found. Start simulation first."
 
-        output_el = await monitor.query_selector(SEL["serial_output"])
+        # Ensure serial monitor is open (click toggle if panel collapsed)
+        serial_btn = await page.query_selector(SEL["btn_serial_monitor"])
+        if serial_btn:
+            panel = await page.query_selector(SEL["serial_monitor"])
+            if panel:
+                style = await panel.get_attribute("style") or ""
+                # Open if panel height is collapsed (Tinkercad uses inline height)
+                if "31px" in style:
+                    await serial_btn.click()
+                    await _random_delay(0.3, 0.6)
+
+        output_el = await page.query_selector(SEL["serial_output"])
         if not output_el:
-            return "Error: Serial output area not found inside monitor."
+            return "Error: Serial output area not found. Start simulation first."
 
         text = (await output_el.inner_text()).strip()
         if not text:

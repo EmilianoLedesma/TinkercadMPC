@@ -21,11 +21,24 @@ def mock_browser_manager(mock_page):
 
 
 def _make_card(circuit_id: str, title: str) -> AsyncMock:
+    """Mock tk-thing-box card matching real Tinkercad DOM structure."""
     card = AsyncMock()
-    card.get_attribute = AsyncMock(return_value=circuit_id)
-    title_el = AsyncMock()
-    title_el.inner_text = AsyncMock(return_value=title)
-    card.query_selector = AsyncMock(return_value=title_el)
+
+    h3 = AsyncMock()
+    h3.inner_text = AsyncMock(return_value=title)
+
+    # .thumbnail[id^='thumbnail-'] carries the design ID
+    thumb = AsyncMock()
+    thumb.get_attribute = AsyncMock(return_value=f"thumbnail-{circuit_id}")
+
+    async def card_query(selector):
+        if "h3" in selector:
+            return h3
+        if "thumbnail" in selector:
+            return thumb
+        return None
+
+    card.query_selector = card_query
     return card
 
 
@@ -194,6 +207,7 @@ void loop() { digitalWrite(13, HIGH); delay(1000); digitalWrite(13, LOW); delay(
 
 @pytest.mark.asyncio
 async def test_add_code_arduino_not_found(mock_browser_manager, mock_page):
+    """Code button missing = circuit not open."""
     mock_page.query_selector.return_value = None
 
     with patch("tinkercad_mcp.api.BrowserManager.get_instance", return_value=mock_browser_manager):
@@ -202,25 +216,17 @@ async def test_add_code_arduino_not_found(mock_browser_manager, mock_page):
         result = await add_code_to_arduino("arduino-99", BLINK_SKETCH)
 
     assert "error" in result.lower()
-    assert "arduino-99" in result
+    # New flow: comp_id not looked up in DOM; failure = code panel button missing
+    assert "code button" in result.lower() or "not found" in result.lower()
 
 
 @pytest.mark.asyncio
 async def test_add_code_success(mock_browser_manager, mock_page):
-    arduino_el = AsyncMock()
+    """Code panel opens, CodeMirror API sets the sketch."""
     code_btn = AsyncMock()
-    editor_el = AsyncMock()
-    upload_btn = AsyncMock()
-    call_seq = [arduino_el, code_btn, editor_el, upload_btn]
-    call_count = 0
-
-    async def sel_side_effect(selector):
-        nonlocal call_count
-        val = call_seq[call_count] if call_count < len(call_seq) else AsyncMock()
-        call_count += 1
-        return val
-
-    mock_page.query_selector.side_effect = sel_side_effect
+    mock_page.query_selector.return_value = code_btn
+    # CodeMirror.setValue() returns "ok" via page.evaluate
+    mock_page.evaluate.return_value = "ok"
 
     with patch("tinkercad_mcp.api.BrowserManager.get_instance", return_value=mock_browser_manager):
         from tinkercad_mcp.api import add_code_to_arduino
@@ -228,7 +234,7 @@ async def test_add_code_success(mock_browser_manager, mock_page):
         result = await add_code_to_arduino("arduino-1", BLINK_SKETCH)
 
     assert "arduino-1" in result
-    assert str(len(BLINK_SKETCH)) in result or "uploaded" in result.lower()
+    assert str(len(BLINK_SKETCH)) in result or "set" in result.lower()
 
 
 # ── start / stop simulation ───────────────────────────────────────────────────
@@ -248,7 +254,9 @@ async def test_start_simulation_no_button(mock_browser_manager, mock_page):
 
 @pytest.mark.asyncio
 async def test_start_simulation_success(mock_browser_manager, mock_page):
-    mock_page.query_selector.return_value = AsyncMock()
+    btn = AsyncMock()
+    btn.inner_text = AsyncMock(return_value="Start Simulation")
+    mock_page.query_selector.return_value = btn
 
     with patch("tinkercad_mcp.api.BrowserManager.get_instance", return_value=mock_browser_manager):
         from tinkercad_mcp.api import start_simulation
@@ -272,7 +280,9 @@ async def test_stop_simulation_no_button(mock_browser_manager, mock_page):
 
 @pytest.mark.asyncio
 async def test_stop_simulation_success(mock_browser_manager, mock_page):
-    mock_page.query_selector.return_value = AsyncMock()
+    btn = AsyncMock()
+    btn.inner_text = AsyncMock(return_value="Stop Simulation")
+    mock_page.query_selector.return_value = btn
 
     with patch("tinkercad_mcp.api.BrowserManager.get_instance", return_value=mock_browser_manager):
         from tinkercad_mcp.api import stop_simulation
@@ -287,7 +297,23 @@ async def test_stop_simulation_success(mock_browser_manager, mock_page):
 
 @pytest.mark.asyncio
 async def test_get_simulation_output_no_monitor(mock_browser_manager, mock_page):
-    mock_page.query_selector.return_value = None
+    """serial_output element missing → error."""
+    # btn_serial_monitor found, panel found but serial_output not found
+    serial_btn = AsyncMock()
+    panel = AsyncMock()
+    panel.get_attribute = AsyncMock(return_value="height: 200px")  # expanded, no click needed
+    call_count = 0
+
+    async def sel_side_effect(selector):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return serial_btn   # btn_serial_monitor
+        if call_count == 2:
+            return panel        # serial_monitor panel
+        return None             # serial_output not found
+
+    mock_page.query_selector.side_effect = sel_side_effect
 
     with patch("tinkercad_mcp.api.BrowserManager.get_instance", return_value=mock_browser_manager):
         from tinkercad_mcp.api import get_simulation_output
@@ -299,11 +325,24 @@ async def test_get_simulation_output_no_monitor(mock_browser_manager, mock_page)
 
 @pytest.mark.asyncio
 async def test_get_simulation_output_with_data(mock_browser_manager, mock_page):
-    monitor_el = AsyncMock()
+    """Serial monitor expanded, output contains text."""
+    serial_btn = AsyncMock()
+    panel = AsyncMock()
+    panel.get_attribute = AsyncMock(return_value="height: 200px")  # already expanded
     output_el = AsyncMock()
     output_el.inner_text = AsyncMock(return_value="Hello World\nHello World\n")
-    monitor_el.query_selector = AsyncMock(return_value=output_el)
-    mock_page.query_selector.return_value = monitor_el
+    call_count = 0
+
+    async def sel_side_effect(selector):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return serial_btn   # btn_serial_monitor
+        if call_count == 2:
+            return panel        # serial_monitor panel
+        return output_el        # serial_output
+
+    mock_page.query_selector.side_effect = sel_side_effect
 
     with patch("tinkercad_mcp.api.BrowserManager.get_instance", return_value=mock_browser_manager):
         from tinkercad_mcp.api import get_simulation_output
@@ -316,11 +355,24 @@ async def test_get_simulation_output_with_data(mock_browser_manager, mock_page):
 
 @pytest.mark.asyncio
 async def test_get_simulation_output_empty_monitor(mock_browser_manager, mock_page):
-    monitor_el = AsyncMock()
+    """Serial monitor expanded but no output yet."""
+    serial_btn = AsyncMock()
+    panel = AsyncMock()
+    panel.get_attribute = AsyncMock(return_value="height: 200px")
     output_el = AsyncMock()
     output_el.inner_text = AsyncMock(return_value="   ")
-    monitor_el.query_selector = AsyncMock(return_value=output_el)
-    mock_page.query_selector.return_value = monitor_el
+    call_count = 0
+
+    async def sel_side_effect(selector):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return serial_btn
+        if call_count == 2:
+            return panel
+        return output_el
+
+    mock_page.query_selector.side_effect = sel_side_effect
 
     with patch("tinkercad_mcp.api.BrowserManager.get_instance", return_value=mock_browser_manager):
         from tinkercad_mcp.api import get_simulation_output

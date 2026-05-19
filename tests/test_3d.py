@@ -21,12 +21,25 @@ def mock_browser_manager(mock_page):
 
 
 def _make_card(design_id: str, title: str) -> AsyncMock:
-    """Build a mock design card element."""
+    """Build a mock tk-thing-box card matching real Tinkercad DOM."""
     card = AsyncMock()
-    card.get_attribute = AsyncMock(return_value=design_id)
-    title_el = AsyncMock()
-    title_el.inner_text = AsyncMock(return_value=title)
-    card.query_selector = AsyncMock(return_value=title_el)
+
+    # h3 title element
+    h3 = AsyncMock()
+    h3.inner_text = AsyncMock(return_value=title)
+
+    # .thumbnail[id^='thumbnail-'] element with id="thumbnail-{design_id}"
+    thumb = AsyncMock()
+    thumb.get_attribute = AsyncMock(return_value=f"thumbnail-{design_id}")
+
+    async def card_query(selector):
+        if "h3" in selector:
+            return h3
+        if "thumbnail" in selector:
+            return thumb
+        return None
+
+    card.query_selector = card_query
     return card
 
 

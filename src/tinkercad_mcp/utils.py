@@ -11,7 +11,13 @@ SESSION_FILE = SESSION_DIR / "session.json"
 
 TINKERCAD_BASE = "https://www.tinkercad.com"
 TINKERCAD_DASHBOARD = f"{TINKERCAD_BASE}/dashboard"
+TINKERCAD_DASHBOARD_DESIGNS = f"{TINKERCAD_BASE}/dashboard/designs"
 TINKERCAD_LOGIN = f"{TINKERCAD_BASE}/login"
+
+# Circuit editor uses /editel, 3D editor uses /edit
+# Verified 2026-05-19 against live DOM
+TINKERCAD_3D_EDIT_SUFFIX = "edit"
+TINKERCAD_CIRCUIT_EDIT_SUFFIX = "editel"
 
 # ── DOM Selectors ─────────────────────────────────────────────────────────────
 # All selectors verified against live Tinkercad DOM (2026-05-19).
@@ -59,23 +65,47 @@ SEL: dict[str, str] = {
     "btn_confirm_delete": ".modal .btn-danger, .modal button.button-md:not(.button-cancel)",
 
     # ── 3D editor ─────────────────────────────────────────────────────────────
-    # TODO: verify after opening a 3D design editor
+    # TODO: verify after opening a 3D design editor — selectors below are best-guess
     "design_name_input": "input[name='name'], input[placeholder*='name']",
     "btn_export":        "button[title*='Export'], button[aria-label*='Export']",
     "btn_export_stl":    "button[title='STL'], a[title='STL']",
     "shape_toolbar":     ".shape-toolbar, [class*='ShapePanel']",
 
-    # ── Circuit editor ────────────────────────────────────────────────────────
-    # TODO: verify after opening a circuit editor
-    "circuit_canvas":    "canvas#my-canvas, canvas[class*='circuit'], canvas",
-    "btn_start_sim":     "button[title*='Start'], button[aria-label*='Start Simulation']",
-    "btn_stop_sim":      "button[title*='Stop'], button[aria-label*='Stop Simulation']",
-    "serial_monitor":    "[class*='serial-monitor'], [class*='SerialMonitor']",
-    "serial_output":     "[class*='serial-output'], [class*='console-output']",
-    "component_search":  "input[placeholder*='Search'], input[placeholder*='search']",
-    "btn_add_code":      "button[title*='Code'], button[aria-label*='Code Editor']",
-    "code_editor":       "textarea.code-input, [class*='CodeMirror'] textarea, .ace_editor",
-    "btn_upload_code":   "button[title*='Upload'], button[aria-label*='Upload']",
+    # ── Circuit editor — verified 2026-05-19 ─────────────────────────────────
+    # Main drawing canvas
+    "circuit_canvas":       "canvas.js-tpl-target__render-canvas",
+
+    # Component search box (right panel)
+    "component_search":     "input#q",
+
+    # Start/Stop simulation — same element, text toggles between states
+    "btn_start_sim":        "a#SIMULATION_ID",
+    "btn_stop_sim":         "a#SIMULATION_ID",
+
+    # Open code editor panel
+    "btn_add_code":         "a#CODE_EDITOR_ID",
+
+    # Code panel container
+    "code_panel":           ".code_panel",
+
+    # Hidden textarea backing the CodeMirror editor (use CM API to set value)
+    "code_editor_textarea": "textarea.js-code_editor__textarea",
+
+    # CodeMirror editor instance (use page.evaluate to call .CodeMirror.setValue())
+    "code_editor_cm":       ".CodeMirror",
+
+    # Serial Monitor toggle button (inside code panel)
+    "btn_serial_monitor":   "a#SERIAL_MONITOR_ID",
+
+    # Serial monitor panel
+    "serial_monitor":       ".code_panel__serial",
+
+    # Serial output text (populated during simulation)
+    "serial_output":        ".code_panel__serial__output, .js-code_panel__serial__output",
+
+    # Circuit design title (display span + editable input)
+    "circuit_title_span":   "span.js-circuit-menu-title",
+    "circuit_title_input":  "input.js-circuit-menu-title-input",
 }
 
 # ── Component catalog ─────────────────────────────────────────────────────────

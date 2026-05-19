@@ -63,11 +63,14 @@ async def test_get_session_status_active(mock_browser_manager, mock_page):
     name_el = AsyncMock()
     name_el.inner_text = AsyncMock(return_value="Ada Lovelace")
 
+    # SEL["user_avatar"] = ".header-avatar-trigger"  (contains "avatar")
+    # SEL["user_name"]   = ".dashboard-avatar-username"  (contains BOTH "avatar" AND "username")
+    # Must check username specifically to avoid collision
     async def sel_side_effect(selector):
+        if "username" in selector:
+            return name_el
         if "avatar" in selector:
             return avatar_el
-        if "name" in selector:
-            return name_el
         return None
 
     mock_page.query_selector.side_effect = sel_side_effect
