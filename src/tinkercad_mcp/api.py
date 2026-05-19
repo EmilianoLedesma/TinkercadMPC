@@ -592,39 +592,215 @@ async def connect_pins(comp_a: str, pin_a: str, comp_b: str, pin_b: str) -> str:
 async def connect_pins_by_coords(
     src_x: float, src_y: float, dst_x: float, dst_y: float
 ) -> str:
-    """Connect two pins using raw canvas pixel coordinates.
+    """Connect two pins/holes using canvas pixel coordinates.
 
-    Use this when you know the exact pixel positions of the pins on the canvas.
-    Coordinates are relative to the canvas origin (top-left corner).
+    Uses jQuery two-click wire drawing: click src → move → click dst.
+    Coordinates are canvas-relative (origin = canvas top-left corner).
 
     Args:
-        src_x, src_y: Source pin position on canvas
-        dst_x, dst_y: Destination pin position on canvas
+        src_x, src_y: Source position on canvas (pixels from canvas origin)
+        dst_x, dst_y: Destination position on canvas (pixels from canvas origin)
     """
     try:
         page = await _get_page()
-        canvas = await page.query_selector(SEL["circuit_canvas"])
-        if not canvas:
-            return "Error: Circuit canvas not found. Is a circuit open?"
 
-        canvas_box = await canvas.bounding_box()
-        if not canvas_box:
-            return "Error: Could not get canvas bounding box."
+        result = await page.evaluate(
+            """
+            async ([sx, sy, dx, dy]) => {
+                const canvas = document.querySelector('canvas.js-tpl-target__render-canvas');
+                if (!canvas) return { error: 'no canvas' };
+                const cr = canvas.getBoundingClientRect();
 
-        ox, oy = canvas_box["x"], canvas_box["y"]
+                // Canvas-relative → screen coords
+                const ssx = cr.x + sx, ssy = cr.y + sy;
+                const dsx = cr.x + dx, dsy = cr.y + dy;
 
-        await page.mouse.move(ox + src_x, oy + src_y)
-        await page.mouse.down()
-        await _random_delay(0.1, 0.2)
-        await page.mouse.move(ox + dst_x, oy + dst_y, steps=15)
-        await page.mouse.up()
-        await _random_delay()
+                const fire = (el, type, x, y) => {
+                    if (!el) return;
+                    jQuery(el).trigger(jQuery.Event(type, {
+                        clientX: x, clientY: y, pageX: x, pageY: y, which: 1, button: 0
+                    }));
+                };
 
-        return json.dumps({
-            "wire": f"({src_x},{src_y}) → ({dst_x},{dst_y})",
-        })
+                // ESC to cancel any in-progress wire
+                document.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 27, bubbles: true }));
+                await new Promise(r => setTimeout(r, 200));
+
+                // Click 1 — start wire at source
+                const srcEl = document.elementFromPoint(ssx, ssy);
+                fire(srcEl, 'mousedown', ssx, ssy);
+                await new Promise(r => setTimeout(r, 80));
+                fire(srcEl, 'mouseup', ssx, ssy);
+                fire(srcEl, 'click', ssx, ssy);
+                await new Promise(r => setTimeout(r, 400));
+
+                // Move preview to destination
+                fire(document, 'mousemove', dsx, dsy);
+                await new Promise(r => setTimeout(r, 200));
+
+                // Click 2 — complete wire at destination
+                const dstEl = document.elementFromPoint(dsx, dsy);
+                fire(dstEl, 'mousedown', dsx, dsy);
+                await new Promise(r => setTimeout(r, 80));
+                fire(dstEl, 'mouseup', dsx, dsy);
+                fire(dstEl, 'click', dsx, dsy);
+
+                return {
+                    src: { x: sx, y: sy, screen_x: ssx, screen_y: ssy, el: srcEl?.tagName },
+                    dst: { x: dx, y: dy, screen_x: dsx, screen_y: dsy, el: dstEl?.tagName },
+                };
+            }
+            """,
+            [src_x, src_y, dst_x, dst_y],
+        )
+
+        if result and "error" in result:
+            return f"Error: {result['error']}"
+
+        await _random_delay(0.3, 0.6)
+        return json.dumps({"wire": f"({src_x},{src_y}) → ({dst_x},{dst_y})"})
     except Exception as exc:
         return f"Error connecting pins by coords: {exc}"
+
+
+async def get_breadboard_grid() -> str:
+    """Scan the canvas SVG for breadboard holes and return a structured grid map.
+
+    Tinkercad renders breadboard holes as SVG circles with class
+    cgfx__breadboard-round. This function reads their live screen positions
+    and returns a grid keyed by standard breadboard notation:
+      - Rows: a-e (top half), f-j (bottom half)
+      - Columns: 1-N (left to right)
+      - Power rails: pwr_top_pos, pwr_top_neg, pwr_bot_pos, pwr_bot_neg
+
+    Returns:
+        JSON: {"grid": {"a1": {"x":int,"y":int}, "b5": {...}, ...}, "cols": N, "rows": 10}
+    """
+    try:
+        page = await _get_page()
+
+        grid_data = await page.evaluate("""
+            () => {
+                const canvas = document.querySelector('canvas.js-tpl-target__render-canvas');
+                if (!canvas) return null;
+                const cr = canvas.getBoundingClientRect();
+
+                // Find breadboard holes: small dark circles inside cgfx__breadboard-round
+                const circles = Array.from(document.querySelectorAll(
+                    '[class*="breadboard-round"] circle, .cgfx__breadboard-round circle'
+                ));
+
+                if (circles.length === 0) return { error: 'no breadboard circles found' };
+
+                // Collect unique (x, y) canvas-relative positions
+                const pts = [];
+                const seen = new Set();
+                for (const c of circles) {
+                    const r = c.getBoundingClientRect();
+                    if (r.width === 0) continue;
+                    const cx = Math.round(r.x + r.width / 2 - cr.x);
+                    const cy = Math.round(r.y + r.height / 2 - cr.y);
+                    const key = `${cx},${cy}`;
+                    if (!seen.has(key)) { seen.add(key); pts.push({ x: cx, y: cy }); }
+                }
+
+                // Group unique x (columns) and y (rows) values
+                const xs = [...new Set(pts.map(p => p.x))].sort((a, b) => a - b);
+                const ys = [...new Set(pts.map(p => p.y))].sort((a, b) => a - b);
+
+                // Identify row sections by gaps > 12px
+                const rowGroups = [];
+                let group = [ys[0]];
+                for (let i = 1; i < ys.length; i++) {
+                    if (ys[i] - ys[i - 1] > 12) {
+                        rowGroups.push(group);
+                        group = [];
+                    }
+                    group.push(ys[i]);
+                }
+                rowGroups.push(group);
+
+                // Expected groups: [pwr_top], [a-e], [f-j], [pwr_bot]
+                // Map row names based on group sizes
+                const ROW_NAMES = ['a','b','c','d','e','f','g','h','i','j'];
+                const namedRows = {};
+
+                for (const grp of rowGroups) {
+                    if (grp.length === 2) {
+                        // Power rail — determine top or bottom by position
+                        const isTop = grp[0] < ys[Math.floor(ys.length / 2)];
+                        namedRows[isTop ? 'pwr_top_pos' : 'pwr_bot_pos'] = grp[0];
+                        namedRows[isTop ? 'pwr_top_neg' : 'pwr_bot_neg'] = grp[1];
+                    } else {
+                        // Main rows — assign a-e or f-j
+                        const startIdx = Object.keys(namedRows).filter(k => k.length === 1).length;
+                        grp.forEach((y, i) => { namedRows[ROW_NAMES[startIdx + i]] = y; });
+                    }
+                }
+
+                // Build grid map: notation -> {x, y}
+                const grid = {};
+                for (const [rowName, rowY] of Object.entries(namedRows)) {
+                    xs.forEach((colX, colIdx) => {
+                        const col = colIdx + 1;
+                        const key = `${rowName}${col}`;
+                        // Verify this point actually exists
+                        if (pts.some(p => p.x === colX && p.y === rowY)) {
+                            grid[key] = { x: colX, y: rowY };
+                        }
+                    });
+                }
+
+                return {
+                    grid,
+                    cols: xs.length,
+                    rows: Object.keys(namedRows).filter(k => k.length === 1).length,
+                    row_names: Object.keys(namedRows),
+                    x_range: [xs[0], xs[xs.length - 1]],
+                    y_range: [ys[0], ys[ys.length - 1]],
+                };
+            }
+        """)
+
+        if not grid_data:
+            return "Error: No breadboard found on canvas. Add a breadboard first."
+        if "error" in grid_data:
+            return f"Error: {grid_data['error']}"
+
+        return json.dumps(grid_data, indent=2)
+    except Exception as exc:
+        return f"Error getting breadboard grid: {exc}"
+
+
+async def connect_breadboard_holes(hole_a: str, hole_b: str) -> str:
+    """Connect two breadboard holes with a wire using hole notation.
+
+    Args:
+        hole_a: Source hole notation (e.g. 'a5', 'f12', 'pwr_top_pos1')
+        hole_b: Destination hole notation (e.g. 'e5', 'j12', 'pwr_top_neg1')
+
+    Returns:
+        JSON confirmation or error with available hole names.
+    """
+    try:
+        grid_json = await get_breadboard_grid()
+        if grid_json.startswith("Error"):
+            return grid_json
+
+        grid_data = json.loads(grid_json)
+        grid = grid_data["grid"]
+
+        if hole_a not in grid:
+            return f"Error: '{hole_a}' not found. Available rows: {grid_data['row_names']}, cols: 1-{grid_data['cols']}"
+        if hole_b not in grid:
+            return f"Error: '{hole_b}' not found. Available rows: {grid_data['row_names']}, cols: 1-{grid_data['cols']}"
+
+        src = grid[hole_a]
+        dst = grid[hole_b]
+
+        return await connect_pins_by_coords(src["x"], src["y"], dst["x"], dst["y"])
+    except Exception as exc:
+        return f"Error connecting breadboard holes: {exc}"
 
 
 async def add_code_to_arduino(comp_id: str, sketch: str) -> str:

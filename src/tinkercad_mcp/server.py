@@ -398,6 +398,20 @@ class ConnectByCoordsInput(BaseModel):
     dst_y: float = Field(..., description="Destination pin Y position on canvas (pixels from top)")
 
 
+class ConnectHolesInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    hole_a: str = Field(
+        ...,
+        description="Source breadboard hole notation (e.g. 'a5', 'f12', 'pwr_top_pos1'). "
+                    "Call tinkercad_get_breadboard_grid first to see available holes.",
+    )
+    hole_b: str = Field(
+        ...,
+        description="Destination breadboard hole notation (e.g. 'e5', 'j12').",
+    )
+
+
 @mcp.tool(
     name="tinkercad_connect_pins_by_coords",
     annotations={
@@ -424,6 +438,57 @@ async def tinkercad_connect_pins_by_coords(params: ConnectByCoordsInput) -> str:
     return await api.connect_pins_by_coords(
         params.src_x, params.src_y, params.dst_x, params.dst_y
     )
+
+
+@mcp.tool(
+    name="tinkercad_get_breadboard_grid",
+    annotations={
+        "title": "Get Breadboard Grid",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def tinkercad_get_breadboard_grid() -> str:
+    """Scan the canvas for breadboard holes and return a structured grid map.
+
+    Must be called before tinkercad_connect_breadboard_holes to get valid hole names.
+    Returns hole notation (e.g. 'a5', 'f12', 'pwr_top_pos1') mapped to canvas coordinates.
+
+    Returns:
+        str: JSON with {"grid": {"a1": {"x":int,"y":int}, ...}, "cols": N, "rows": 10, "row_names": [...]}
+    """
+    return await api.get_breadboard_grid()
+
+
+@mcp.tool(
+    name="tinkercad_connect_breadboard_holes",
+    annotations={
+        "title": "Connect Breadboard Holes",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
+async def tinkercad_connect_breadboard_holes(params: ConnectHolesInput) -> str:
+    """Connect two breadboard holes with a wire.
+
+    Use standard breadboard notation:
+      - Main holes: row letter (a-j) + column number (e.g. 'a5', 'f12')
+      - Power rails: 'pwr_top_pos1', 'pwr_top_neg1', 'pwr_bot_pos1', etc.
+
+    Call tinkercad_get_breadboard_grid first to confirm hole names and columns.
+
+    Args:
+        params.hole_a (str): Source hole (e.g. 'a5')
+        params.hole_b (str): Destination hole (e.g. 'e5')
+
+    Returns:
+        str: JSON wire confirmation or error with available holes.
+    """
+    return await api.connect_breadboard_holes(params.hole_a, params.hole_b)
 
 
 @mcp.tool(
