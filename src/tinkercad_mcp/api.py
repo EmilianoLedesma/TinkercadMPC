@@ -156,7 +156,11 @@ async def list_designs() -> str:
 
 async def _open_create_dropdown(page) -> bool:
     """Click the '+Create' button to open the type-selection dropdown.
-    Returns True if dropdown opened successfully."""
+    Waits up to 15s for Angular to render the button. Returns True on success."""
+    try:
+        await page.wait_for_selector(SEL["btn_create_dropdown"], timeout=15_000)
+    except Exception:
+        return False
     btn = await page.query_selector(SEL["btn_create_dropdown"])
     if not btn:
         return False
@@ -479,15 +483,20 @@ async def add_component(component_type: str, x: float, y: float) -> str:
         dst_x = canvas_box["x"] + x
         dst_y = canvas_box["y"] + y
 
-        # Playwright native mouse drag — more reliable than JS dispatchEvent
+        # Playwright native mouse drag
         await page.mouse.move(src_x, src_y)
         await page.mouse.down()
         await _random_delay(0.2, 0.3)
-        # Move gradually so Tinkercad's drag handler tracks correctly
         await page.mouse.move(dst_x, dst_y, steps=15)
         await _random_delay(0.1, 0.2)
         await page.mouse.up()
         await _random_delay(0.5, 1.0)
+
+        # Press Escape immediately after drop to deselect the component.
+        # This prevents Tinkercad from auto-panning to follow the new component,
+        # keeping subsequent drop coordinates stable.
+        await page.keyboard.press("Escape")
+        await _random_delay(0.2, 0.3)
 
         return json.dumps({
             "component": component_type,
@@ -499,429 +508,74 @@ async def add_component(component_type: str, x: float, y: float) -> str:
         return f"Error adding component: {exc}"
 
 
-async def connect_pins(comp_a: str, pin_a: str, comp_b: str, pin_b: str) -> str:
-    """Connect two component pins with a wire.
-
-    Tinkercad renders the circuit on an HTML5 canvas — pins are not standard DOM
-    elements. Connection is done by clicking on the source pin position and
-    dragging to the destination pin position (canvas pixel coordinates).
-
-    To find pin coordinates:
-    1. Call get_component_pin_positions(comp_id) to get a map of pin names → coords.
-    2. Pass those coords here.
-
-    Args:
-        comp_a: Source component identifier (data-did, e.g. '58422' for LED)
-        pin_a: Source pin name (e.g. 'Anode', 'Cathode', 'GND', 'D13')
-        comp_b: Destination component identifier
-        pin_b: Destination pin name
-    """
-    try:
-        page = await _get_page()
-
-        # Try to resolve pin positions via circuit_editor internal model
-        pin_coords = await page.evaluate("""
-            ([compA, pinA, compB, pinB]) => {
-                try {
-                    const root = window.circuit_editor?.root;
-                    if (!root) return null;
-                    // objectMap maps local IDs to circuit objects
-                    // Components store pin positions in their data
-                    // This requires deeper mapping — placeholder for now
-                    return null;
-                } catch(e) { return null; }
-            }
-        """, [comp_a, pin_a, comp_b, pin_b])
-
-        if pin_coords:
-            sx, sy = pin_coords["src"]["x"], pin_coords["src"]["y"]
-            dx, dy = pin_coords["dst"]["x"], pin_coords["dst"]["y"]
-        else:
-            # Fallback: try SVG overlay elements (present in some Tinkercad versions)
-            src_el = await page.query_selector(
-                f"[data-did='{comp_a}'] [data-pin='{pin_a}'], "
-                f"[data-component='{comp_a}'] [title='{pin_a}']"
-            )
-            dst_el = await page.query_selector(
-                f"[data-did='{comp_b}'] [data-pin='{pin_b}'], "
-                f"[data-component='{comp_b}'] [title='{pin_b}']"
-            )
-
-            if not src_el or not dst_el:
-                return (
-                    f"Error: Cannot resolve pin positions for "
-                    f"'{comp_a}:{pin_a}' → '{comp_b}:{pin_b}'. "
-                    "Use tinkercad_get_pin_positions to get canvas coordinates, "
-                    "then call tinkercad_connect_pins_by_coords."
-                )
-
-            src_box = await src_el.bounding_box()
-            dst_box = await dst_el.bounding_box()
-            if not src_box or not dst_box:
-                return "Error: Pin elements found but bounding boxes are zero."
-
-            sx = src_box["x"] + src_box["width"] / 2
-            sy = src_box["y"] + src_box["height"] / 2
-            dx = dst_box["x"] + dst_box["width"] / 2
-            dy = dst_box["y"] + dst_box["height"] / 2
-
-        canvas = await page.query_selector(SEL["circuit_canvas"])
-        if not canvas:
-            return "Error: Circuit canvas not found."
-        canvas_box = await canvas.bounding_box()
-        if not canvas_box:
-            return "Error: Could not get canvas bounding box."
-
-        # Click source pin, drag to destination pin
-        await page.mouse.move(canvas_box["x"] + sx, canvas_box["y"] + sy)
-        await page.mouse.down()
-        await _random_delay(0.1, 0.2)
-        await page.mouse.move(
-            canvas_box["x"] + dx,
-            canvas_box["y"] + dy,
-            steps=15,
-        )
-        await page.mouse.up()
-        await _random_delay()
-
-        return json.dumps({"wire": f"{comp_a}:{pin_a} → {comp_b}:{pin_b}"})
-    except Exception as exc:
-        return f"Error connecting pins: {exc}"
-
-
-async def connect_pins_by_coords(
-    src_x: float, src_y: float, dst_x: float, dst_y: float
+def get_wiring_diagram(
+    circuit_name: str,
+    connections: list[dict],
+    notes: str = "",
 ) -> str:
-    """Connect two pins/holes using canvas pixel coordinates.
+    """Generate a human-readable wiring diagram + step-by-step instructions.
 
-    Uses jQuery two-click wire drawing: click src → move → click dst.
-    Coordinates are canvas-relative (origin = canvas top-left corner).
+    This is a pure-Python helper — no browser required.
+    The LLM calls this with the planned circuit topology to produce clear
+    instructions the user can follow to connect wires manually in Tinkercad.
 
     Args:
-        src_x, src_y: Source position on canvas (pixels from canvas origin)
-        dst_x, dst_y: Destination position on canvas (pixels from canvas origin)
+        circuit_name: Name of the circuit (e.g. 'LED Blink')
+        connections: List of connection dicts, each with keys:
+            - from_component: str  (e.g. 'Arduino Uno')
+            - from_pin: str        (e.g. 'D13', 'GND', '5V')
+            - to_component: str    (e.g. 'Breadboard', 'LED')
+            - to_pin: str          (e.g. 'e5', 'Anode', 'pwr_top_pos1')
+            - wire_color: str      (optional, e.g. 'green', 'black', 'red')
+            - note: str            (optional, e.g. 'same strip as e5')
+        notes: Optional extra notes appended at the end.
+
+    Returns:
+        str: Formatted wiring guide with ASCII legend and numbered steps.
     """
-    try:
-        page = await _get_page()
+    lines = []
+    lines.append("=" * 56)
+    lines.append(f"  WIRING GUIDE: {circuit_name}")
+    lines.append("=" * 56)
 
-        result = await page.evaluate(
-            """
-            async ([sx, sy, dx, dy]) => {
-                const canvas = document.querySelector('canvas.js-tpl-target__render-canvas');
-                if (!canvas) return { error: 'no canvas' };
-                const cr = canvas.getBoundingClientRect();
+    # Breadboard notation legend
+    lines.append("""
+BREADBOARD NOTATION:
+  Rows a-e  : top half  (all holes in same column = connected)
+  Rows f-j  : bottom half (same rule)
+  pwr_top_+/- : top power rails  (+5V / GND)
+  pwr_bot_+/- : bottom power rails (+5V / GND)
+  e.g. 'e5' = row e, column 5
 
-                const fire = (el, type, x, y) => {
-                    if (!el) return;
-                    jQuery(el).trigger(jQuery.Event(type, {
-                        clientX: x, clientY: y, pageX: x, pageY: y, which: 1, button: 0
-                    }));
-                };
+TIP: holes in the SAME COLUMN and SAME HALF are electrically
+     connected WITHOUT a wire (that's how breadboards work).
+""")
 
-                // Find nearest SVG rect/circle with mousedown handler to a screen point.
-                // This tolerates small view shifts after prior wires.
-                const findNearestPin = (targetScreenX, targetScreenY, radiusPx = 20) => {
-                    const allPins = Array.from(document.querySelectorAll('svg rect, svg circle'))
-                        .filter(el => {
-                            try { return Object.keys(jQuery._data(el, 'events') || {}).includes('mousedown'); }
-                            catch(e) { return false; }
-                        });
-                    let best = null, bestDist = Infinity;
-                    for (const el of allPins) {
-                        const r = el.getBoundingClientRect();
-                        if (r.width === 0) continue;
-                        const cx = r.x + r.width / 2, cy = r.y + r.height / 2;
-                        const d = Math.hypot(cx - targetScreenX, cy - targetScreenY);
-                        if (d < bestDist && d <= radiusPx) { best = el; bestDist = d; }
-                    }
-                    return best;
-                };
+    lines.append("CONNECTIONS (wire each step in order):")
+    lines.append("-" * 56)
 
-                // Canvas-relative → screen coords
-                const ssx = cr.x + sx, ssy = cr.y + sy;
-                const dsx = cr.x + dx, dsy = cr.y + dy;
+    for i, conn in enumerate(connections, 1):
+        frm  = conn.get("from_component", "?")
+        fpin = conn.get("from_pin", "?")
+        to   = conn.get("to_component", "?")
+        tpin = conn.get("to_pin", "?")
+        color = conn.get("wire_color", "")
+        note  = conn.get("note", "")
 
-                // ESC to cancel any in-progress wire
-                document.dispatchEvent(new KeyboardEvent('keydown', { keyCode: 27, bubbles: true }));
-                await new Promise(r => setTimeout(r, 200));
+        color_tag = f"[{color} wire]" if color else ""
+        note_tag  = f"  ← {note}"    if note  else ""
 
-                // Click 1 — start wire at source (prefer exact element, fall back to nearest pin)
-                const srcEl = findNearestPin(ssx, ssy) || document.elementFromPoint(ssx, ssy);
-                const srcR = srcEl?.getBoundingClientRect();
-                const srcX = srcR ? srcR.x + srcR.width / 2 : ssx;
-                const srcY = srcR ? srcR.y + srcR.height / 2 : ssy;
-
-                fire(srcEl, 'mousedown', srcX, srcY);
-                await new Promise(r => setTimeout(r, 80));
-                fire(srcEl, 'mouseup', srcX, srcY);
-                fire(srcEl, 'click', srcX, srcY);
-                await new Promise(r => setTimeout(r, 400));
-
-                // Move preview to destination
-                fire(document, 'mousemove', dsx, dsy);
-                await new Promise(r => setTimeout(r, 200));
-
-                // Click 2 — complete wire at destination
-                const dstEl = findNearestPin(dsx, dsy) || document.elementFromPoint(dsx, dsy);
-                const dstR = dstEl?.getBoundingClientRect();
-                const dstX = dstR ? dstR.x + dstR.width / 2 : dsx;
-                const dstY = dstR ? dstR.y + dstR.height / 2 : dsy;
-
-                fire(dstEl, 'mousedown', dstX, dstY);
-                await new Promise(r => setTimeout(r, 80));
-                fire(dstEl, 'mouseup', dstX, dstY);
-                fire(dstEl, 'click', dstX, dstY);
-
-                return {
-                    src: { canvas: {x:sx,y:sy}, el: srcEl?.tagName, hit: {x:srcX,y:srcY} },
-                    dst: { canvas: {x:dx,y:dy}, el: dstEl?.tagName, hit: {x:dstX,y:dstY} },
-                };
-            }
-            """,
-            [src_x, src_y, dst_x, dst_y],
+        lines.append(
+            f"  {i:2d}. {frm} {fpin:10s} →  {to} {tpin:15s} {color_tag}{note_tag}"
         )
 
-        if result and "error" in result:
-            return f"Error: {result['error']}"
+    if notes:
+        lines.append("")
+        lines.append("NOTES:")
+        lines.append(f"  {notes}")
 
-        await _random_delay(0.3, 0.6)
-        return json.dumps({"wire": f"({src_x},{src_y}) → ({dst_x},{dst_y})"})
-    except Exception as exc:
-        return f"Error connecting pins by coords: {exc}"
-
-
-async def get_component_pins() -> str:
-    """Scan the canvas SVG for interactive component pins and group them by proximity.
-
-    Returns canvas-relative coordinates for each detected component's pins.
-    Excludes breadboard holes. Groups pins within 60px of each other as one component.
-
-    Returns:
-        JSON list of components: [{"id": "comp_0", "pins": [{"x":int,"y":int}, ...]}]
-    """
-    try:
-        page = await _get_page()
-
-        data = await page.evaluate("""
-            () => {
-                const canvas = document.querySelector('canvas.js-tpl-target__render-canvas');
-                if (!canvas) return null;
-                const cr = canvas.getBoundingClientRect();
-
-                // All interactive SVG rects/circles with mousedown handler
-                const els = Array.from(document.querySelectorAll('svg rect, svg circle'))
-                    .filter(el => {
-                        try { return Object.keys(jQuery._data(el, 'events') || {}).includes('mousedown'); }
-                        catch(e) { return false; }
-                    });
-
-                // Collect canvas-relative positions
-                const pts = [];
-                for (const el of els) {
-                    const r = el.getBoundingClientRect();
-                    if (r.width === 0) continue;
-                    const cx = Math.round(r.x + r.width / 2 - cr.x);
-                    const cy = Math.round(r.y + r.height / 2 - cr.y);
-                    // Skip breadboard area (large x range, many holes at same y)
-                    if (cx > 420) continue;
-                    pts.push({ x: cx, y: cy, w: Math.round(r.width) });
-                }
-
-                // Group by y-row buckets (same cy ± 5 = same row)
-                const rows = {};
-                for (const p of pts) {
-                    const bucket = Math.round(p.y / 10) * 10;
-                    if (!rows[bucket]) rows[bucket] = [];
-                    rows[bucket].push(p);
-                }
-
-                // Filter out Arduino pin headers (rows with > 8 pins)
-                const componentPins = [];
-                for (const [bucket, rowPts] of Object.entries(rows)) {
-                    if (rowPts.length <= 8) {
-                        componentPins.push(...rowPts);
-                    }
-                }
-
-                // Proximity clustering: group pins within 60px of each other
-                const clusters = [];
-                const used = new Set();
-                for (let i = 0; i < componentPins.length; i++) {
-                    if (used.has(i)) continue;
-                    const cluster = [componentPins[i]];
-                    used.add(i);
-                    for (let j = i + 1; j < componentPins.length; j++) {
-                        if (used.has(j)) continue;
-                        const dist = Math.hypot(
-                            componentPins[i].x - componentPins[j].x,
-                            componentPins[i].y - componentPins[j].y
-                        );
-                        if (dist <= 60) { cluster.push(componentPins[j]); used.add(j); }
-                    }
-                    clusters.push(cluster);
-                }
-
-                // Build output: sort pins within cluster by x then y
-                return clusters.map((pins, idx) => ({
-                    id: `comp_${idx}`,
-                    pin_count: pins.length,
-                    pins: pins
-                        .sort((a, b) => a.x - b.x || a.y - b.y)
-                        .map(p => ({ x: p.x, y: p.y })),
-                    center: {
-                        x: Math.round(pins.reduce((s, p) => s + p.x, 0) / pins.length),
-                        y: Math.round(pins.reduce((s, p) => s + p.y, 0) / pins.length),
-                    },
-                }));
-            }
-        """)
-
-        if not data:
-            return "Error: No component pins found. Is a circuit open?"
-
-        return json.dumps(data, indent=2)
-    except Exception as exc:
-        return f"Error scanning component pins: {exc}"
-
-
-async def get_breadboard_grid() -> str:
-    """Scan the canvas SVG for breadboard holes and return a structured grid map.
-
-    Tinkercad renders breadboard holes as SVG circles with class
-    cgfx__breadboard-round. This function reads their live screen positions
-    and returns a grid keyed by standard breadboard notation:
-      - Rows: a-e (top half), f-j (bottom half)
-      - Columns: 1-N (left to right)
-      - Power rails: pwr_top_pos, pwr_top_neg, pwr_bot_pos, pwr_bot_neg
-
-    Returns:
-        JSON: {"grid": {"a1": {"x":int,"y":int}, "b5": {...}, ...}, "cols": N, "rows": 10}
-    """
-    try:
-        page = await _get_page()
-
-        grid_data = await page.evaluate("""
-            () => {
-                const canvas = document.querySelector('canvas.js-tpl-target__render-canvas');
-                if (!canvas) return null;
-                const cr = canvas.getBoundingClientRect();
-
-                // Find breadboard holes: small dark circles inside cgfx__breadboard-round
-                const circles = Array.from(document.querySelectorAll(
-                    '[class*="breadboard-round"] circle, .cgfx__breadboard-round circle'
-                ));
-
-                if (circles.length === 0) return { error: 'no breadboard circles found' };
-
-                // Collect unique (x, y) canvas-relative positions
-                const pts = [];
-                const seen = new Set();
-                for (const c of circles) {
-                    const r = c.getBoundingClientRect();
-                    if (r.width === 0) continue;
-                    const cx = Math.round(r.x + r.width / 2 - cr.x);
-                    const cy = Math.round(r.y + r.height / 2 - cr.y);
-                    const key = `${cx},${cy}`;
-                    if (!seen.has(key)) { seen.add(key); pts.push({ x: cx, y: cy }); }
-                }
-
-                // Group unique x (columns) and y (rows) values
-                const xs = [...new Set(pts.map(p => p.x))].sort((a, b) => a - b);
-                const ys = [...new Set(pts.map(p => p.y))].sort((a, b) => a - b);
-
-                // Identify row sections by gaps > 12px
-                const rowGroups = [];
-                let group = [ys[0]];
-                for (let i = 1; i < ys.length; i++) {
-                    if (ys[i] - ys[i - 1] > 12) {
-                        rowGroups.push(group);
-                        group = [];
-                    }
-                    group.push(ys[i]);
-                }
-                rowGroups.push(group);
-
-                // Expected groups: [pwr_top], [a-e], [f-j], [pwr_bot]
-                // Map row names based on group sizes
-                const ROW_NAMES = ['a','b','c','d','e','f','g','h','i','j'];
-                const namedRows = {};
-
-                for (const grp of rowGroups) {
-                    if (grp.length === 2) {
-                        // Power rail — determine top or bottom by position
-                        const isTop = grp[0] < ys[Math.floor(ys.length / 2)];
-                        namedRows[isTop ? 'pwr_top_pos' : 'pwr_bot_pos'] = grp[0];
-                        namedRows[isTop ? 'pwr_top_neg' : 'pwr_bot_neg'] = grp[1];
-                    } else {
-                        // Main rows — assign a-e or f-j
-                        const startIdx = Object.keys(namedRows).filter(k => k.length === 1).length;
-                        grp.forEach((y, i) => { namedRows[ROW_NAMES[startIdx + i]] = y; });
-                    }
-                }
-
-                // Build grid map: notation -> {x, y}
-                const grid = {};
-                for (const [rowName, rowY] of Object.entries(namedRows)) {
-                    xs.forEach((colX, colIdx) => {
-                        const col = colIdx + 1;
-                        const key = `${rowName}${col}`;
-                        // Verify this point actually exists
-                        if (pts.some(p => p.x === colX && p.y === rowY)) {
-                            grid[key] = { x: colX, y: rowY };
-                        }
-                    });
-                }
-
-                return {
-                    grid,
-                    cols: xs.length,
-                    rows: Object.keys(namedRows).filter(k => k.length === 1).length,
-                    row_names: Object.keys(namedRows),
-                    x_range: [xs[0], xs[xs.length - 1]],
-                    y_range: [ys[0], ys[ys.length - 1]],
-                };
-            }
-        """)
-
-        if not grid_data:
-            return "Error: No breadboard found on canvas. Add a breadboard first."
-        if "error" in grid_data:
-            return f"Error: {grid_data['error']}"
-
-        return json.dumps(grid_data, indent=2)
-    except Exception as exc:
-        return f"Error getting breadboard grid: {exc}"
-
-
-async def connect_breadboard_holes(hole_a: str, hole_b: str) -> str:
-    """Connect two breadboard holes with a wire using hole notation.
-
-    Args:
-        hole_a: Source hole notation (e.g. 'a5', 'f12', 'pwr_top_pos1')
-        hole_b: Destination hole notation (e.g. 'e5', 'j12', 'pwr_top_neg1')
-
-    Returns:
-        JSON confirmation or error with available hole names.
-    """
-    try:
-        grid_json = await get_breadboard_grid()
-        if grid_json.startswith("Error"):
-            return grid_json
-
-        grid_data = json.loads(grid_json)
-        grid = grid_data["grid"]
-
-        if hole_a not in grid:
-            return f"Error: '{hole_a}' not found. Available rows: {grid_data['row_names']}, cols: 1-{grid_data['cols']}"
-        if hole_b not in grid:
-            return f"Error: '{hole_b}' not found. Available rows: {grid_data['row_names']}, cols: 1-{grid_data['cols']}"
-
-        src = grid[hole_a]
-        dst = grid[hole_b]
-
-        return await connect_pins_by_coords(src["x"], src["y"], dst["x"], dst["y"])
-    except Exception as exc:
-        return f"Error connecting breadboard holes: {exc}"
+    lines.append("=" * 56)
+    return "\n".join(lines)
 
 
 async def add_code_to_arduino(comp_id: str, sketch: str) -> str:
@@ -940,14 +594,54 @@ async def add_code_to_arduino(comp_id: str, sketch: str) -> str:
     try:
         page = await _get_page()
 
-        # Open code panel
+        # Step 1: open code panel
         code_btn = await page.query_selector(SEL["btn_add_code"])
         if not code_btn:
             return "Error: Code button not found. Is a circuit open?"
         await code_btn.click()
+        await _random_delay(0.8, 1.2)
+
+        # Step 2: switch from Blocks to Text mode if needed.
+        # The mode dropdown shows current mode (e.g. "Blocks"). Click it, select "Text".
+        mode_switched = await page.evaluate("""
+            async () => {
+                // Check current mode
+                const modeBtn = document.querySelector(
+                    '.code_panel__toolbar__mode .editor__dropdown__button, '
+                    + '.code_panel__toolbar__dropdown .editor__dropdown__button'
+                );
+                if (!modeBtn) return 'no_mode_btn';
+                const currentMode = modeBtn.innerText?.trim().toLowerCase();
+                if (currentMode === 'text') return 'already_text';
+
+                // Open the dropdown
+                modeBtn.click();
+                await new Promise(r => setTimeout(r, 400));
+
+                // Click the "Text" option
+                const opts = Array.from(document.querySelectorAll(
+                    '.editor__dropdown__list__option__value'
+                ));
+                const textOpt = opts.find(o => o.innerText?.trim().toLowerCase() === 'text');
+                if (!textOpt) return 'no_text_option';
+                textOpt.click();
+                await new Promise(r => setTimeout(r, 600));
+
+                // Confirm the "Are you sure?" dialog if it appears
+                const continueBtn = Array.from(document.querySelectorAll('button'))
+                    .find(b => b.innerText?.trim().toLowerCase() === 'continue');
+                if (continueBtn) {
+                    continueBtn.click();
+                    await new Promise(r => setTimeout(r, 500));
+                    return 'switched_with_confirm';
+                }
+                return 'switched';
+            }
+        """)
+        logger.info("Code mode switch: %s", mode_switched)
         await _random_delay(0.5, 1.0)
 
-        # Set code via CodeMirror JS API — faster and more reliable than typing
+        # Step 3: set code via CodeMirror JS API
         escaped = sketch.replace("\\", "\\\\").replace("`", "\\`")
         result = await page.evaluate(f"""
             () => {{
@@ -960,10 +654,16 @@ async def add_code_to_arduino(comp_id: str, sketch: str) -> str:
         """)
 
         if result == "no_cm":
-            return "Error: CodeMirror editor not found in code panel."
+            return (
+                "Error: CodeMirror editor not found after mode switch "
+                f"(mode_switch={mode_switched}). Try again."
+            )
 
         await _random_delay(0.3, 0.6)
-        return f"Sketch set for Arduino '{comp_id or 'selected'}' ({len(sketch)} chars)."
+        return (
+            f"Sketch set for Arduino '{comp_id or 'selected'}' "
+            f"({len(sketch)} chars). Mode: {mode_switched}."
+        )
     except Exception as exc:
         return f"Error setting sketch: {exc}"
 

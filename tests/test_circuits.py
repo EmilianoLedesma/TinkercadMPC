@@ -159,46 +159,6 @@ async def test_add_component_valid_catalog_key(mock_browser_manager):
         assert "Unknown component" not in result, f"Key '{key}' flagged as unknown"
 
 
-# ── connect_pins ──────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_connect_pins_source_not_found(mock_browser_manager, mock_page):
-    # evaluate returns None → falls back to DOM lookup → both query_selectors return None
-    mock_page.evaluate.return_value = None
-    mock_page.query_selector.return_value = None
-
-    with patch("tinkercad_mcp.api.BrowserManager.get_instance", return_value=mock_browser_manager):
-        from tinkercad_mcp.api import connect_pins
-
-        result = await connect_pins("arduino-1", "GND", "led-1", "Cathode")
-
-    assert "error" in result.lower()
-    assert "resolve" in result.lower() or "pin" in result.lower()
-
-
-@pytest.mark.asyncio
-async def test_connect_pins_destination_not_found(mock_browser_manager, mock_page):
-    src_pin = AsyncMock()
-    call_count = 0
-
-    # evaluate returns None → falls back to DOM lookup
-    mock_page.evaluate.return_value = None
-
-    async def sel_side_effect(selector):
-        nonlocal call_count
-        call_count += 1
-        return src_pin if call_count == 1 else None
-
-    mock_page.query_selector.side_effect = sel_side_effect
-
-    with patch("tinkercad_mcp.api.BrowserManager.get_instance", return_value=mock_browser_manager):
-        from tinkercad_mcp.api import connect_pins
-
-        result = await connect_pins("arduino-1", "D13", "led-1", "Anode")
-
-    assert "error" in result.lower()
-    assert "resolve" in result.lower() or "pin" in result.lower()
 
 
 # ── add_code_to_arduino ───────────────────────────────────────────────────────

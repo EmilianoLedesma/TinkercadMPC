@@ -69,15 +69,6 @@ class ComponentInput(BaseModel):
     y: float = Field(default=300.0, description="Y drop position on canvas (pixels)")
 
 
-class ConnectPinsInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    comp_a: str = Field(..., description="Source component ID or selector")
-    pin_a: str = Field(..., description="Source pin name (e.g. 'GND', 'D13', '~5V')")
-    comp_b: str = Field(..., description="Destination component ID or selector")
-    pin_b: str = Field(..., description="Destination pin name")
-
-
 class ArduinoCodeInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
@@ -364,154 +355,55 @@ async def tinkercad_add_component(params: ComponentInput) -> str:
     return await api.add_component(params.component_type, params.x, params.y)
 
 
-@mcp.tool(
-    name="tinkercad_connect_pins",
-    annotations={
-        "title": "Connect Component Pins",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
-async def tinkercad_connect_pins(params: ConnectPinsInput) -> str:
-    """Connect two component pins with a wire.
-
-    Args:
-        params.comp_a (str): Source component ID
-        params.pin_a (str): Source pin label (e.g. 'GND', 'D13', '~5V', 'Anode')
-        params.comp_b (str): Destination component ID
-        params.pin_b (str): Destination pin label
-
-    Returns:
-        str: JSON {"wire": "compA:pinA → compB:pinB"} or error.
-    """
-    return await api.connect_pins(params.comp_a, params.pin_a, params.comp_b, params.pin_b)
-
-
-class ConnectByCoordsInput(BaseModel):
+class WiringDiagramInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    src_x: float = Field(..., description="Source pin X position on canvas (pixels from left)")
-    src_y: float = Field(..., description="Source pin Y position on canvas (pixels from top)")
-    dst_x: float = Field(..., description="Destination pin X position on canvas (pixels from left)")
-    dst_y: float = Field(..., description="Destination pin Y position on canvas (pixels from top)")
-
-
-class ConnectHolesInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
-
-    hole_a: str = Field(
+    circuit_name: str = Field(..., description="Name of the circuit (e.g. 'LED Blink')")
+    connections: list[dict] = Field(
         ...,
-        description="Source breadboard hole notation (e.g. 'a5', 'f12', 'pwr_top_pos1'). "
-                    "Call tinkercad_get_breadboard_grid first to see available holes.",
+        description=(
+            "List of connection objects. Each must have: "
+            "from_component, from_pin, to_component, to_pin. "
+            "Optional: wire_color, note. "
+            "Example: {\"from_component\":\"Arduino Uno\",\"from_pin\":\"D13\","
+            "\"to_component\":\"Breadboard\",\"to_pin\":\"e5\","
+            "\"wire_color\":\"green\"}"
+        ),
     )
-    hole_b: str = Field(
-        ...,
-        description="Destination breadboard hole notation (e.g. 'e5', 'j12').",
-    )
+    notes: str = Field(default="", description="Optional extra notes for the user")
 
 
 @mcp.tool(
-    name="tinkercad_connect_pins_by_coords",
+    name="tinkercad_get_wiring_diagram",
     annotations={
-        "title": "Connect Pins by Canvas Coordinates",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
-async def tinkercad_connect_pins_by_coords(params: ConnectByCoordsInput) -> str:
-    """Connect two pins using raw canvas pixel coordinates.
-
-    Use when tinkercad_connect_pins cannot resolve pin DOM elements.
-    Coordinates are relative to the canvas top-left corner.
-
-    Args:
-        params.src_x, params.src_y: Source pin position on canvas
-        params.dst_x, params.dst_y: Destination pin position on canvas
-
-    Returns:
-        str: JSON confirmation or error.
-    """
-    return await api.connect_pins_by_coords(
-        params.src_x, params.src_y, params.dst_x, params.dst_y
-    )
-
-
-@mcp.tool(
-    name="tinkercad_get_component_pins",
-    annotations={
-        "title": "Get Component Pin Positions",
+        "title": "Get Wiring Diagram",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
-        "openWorldHint": True,
+        "openWorldHint": False,
     },
 )
-async def tinkercad_get_component_pins() -> str:
-    """Scan the circuit canvas and return pin positions for each detected component.
+async def tinkercad_get_wiring_diagram(params: WiringDiagramInput) -> str:
+    """Generate a human-readable wiring guide for the user to connect circuit wires.
 
-    Groups interactive SVG pins by proximity. Excludes breadboard holes and
-    Arduino header rows (>8 pins). Call this to discover which canvas coordinates
-    to pass to tinkercad_connect_pins_by_coords.
+    Call this after adding all components to the circuit. The LLM provides the
+    planned connections and this tool returns a formatted diagram + numbered steps
+    the user can follow manually in Tinkercad.
 
-    Returns:
-        str: JSON list [{"id":"comp_0","pin_count":2,"pins":[{"x":int,"y":int}],"center":{...}}]
-    """
-    return await api.get_component_pins()
-
-
-@mcp.tool(
-    name="tinkercad_get_breadboard_grid",
-    annotations={
-        "title": "Get Breadboard Grid",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    },
-)
-async def tinkercad_get_breadboard_grid() -> str:
-    """Scan the canvas for breadboard holes and return a structured grid map.
-
-    Must be called before tinkercad_connect_breadboard_holes to get valid hole names.
-    Returns hole notation (e.g. 'a5', 'f12', 'pwr_top_pos1') mapped to canvas coordinates.
-
-    Returns:
-        str: JSON with {"grid": {"a1": {"x":int,"y":int}, ...}, "cols": N, "rows": 10, "row_names": [...]}
-    """
-    return await api.get_breadboard_grid()
-
-
-@mcp.tool(
-    name="tinkercad_connect_breadboard_holes",
-    annotations={
-        "title": "Connect Breadboard Holes",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
-)
-async def tinkercad_connect_breadboard_holes(params: ConnectHolesInput) -> str:
-    """Connect two breadboard holes with a wire.
-
-    Use standard breadboard notation:
-      - Main holes: row letter (a-j) + column number (e.g. 'a5', 'f12')
-      - Power rails: 'pwr_top_pos1', 'pwr_top_neg1', 'pwr_bot_pos1', etc.
-
-    Call tinkercad_get_breadboard_grid first to confirm hole names and columns.
+    Breadboard notation: rows a-j, columns 1-N (e.g. 'e5' = row e col 5).
+    Holes in the same column and same half (a-e or f-j) are electrically connected.
 
     Args:
-        params.hole_a (str): Source hole (e.g. 'a5')
-        params.hole_b (str): Destination hole (e.g. 'e5')
+        params.circuit_name (str): Name of the circuit
+        params.connections (list): Connection specs with from/to component+pin
+        params.notes (str): Optional extra notes
 
     Returns:
-        str: JSON wire confirmation or error with available holes.
+        str: Formatted wiring guide with legend and numbered steps.
     """
-    return await api.connect_breadboard_holes(params.hole_a, params.hole_b)
+    return api.get_wiring_diagram(
+        params.circuit_name, params.connections, params.notes
+    )
 
 
 @mcp.tool(

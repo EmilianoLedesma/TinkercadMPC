@@ -71,7 +71,7 @@ class BrowserManager:
         self._context = await self._browser.new_context(
             storage_state=storage_state,
             user_agent=USER_AGENT,
-            viewport={"width": 1280, "height": 800},
+            viewport={"width": 1920, "height": 1080},
         )
         self._page = await self._context.new_page()
 
